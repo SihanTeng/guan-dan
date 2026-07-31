@@ -107,14 +107,26 @@ pub enum ServerMessage {
         seat: Seat,
         must_lead: bool,
         last_play: Option<PublicPlay>,
+        /// Turn time limit in seconds (server standard timer).
+        #[serde(default = "default_turn_timeout_secs")]
+        timeout_secs: u32,
     },
     CardPlayed {
         seat: Seat,
         cards: Vec<Card>,
         hand_type: HandType,
         counts: [usize; 4],
+        /// How long clients should hold this play on screen (seconds).
+        #[serde(default = "default_play_reveal_secs")]
+        reveal_secs: u32,
     },
     PlayerPass {
+        seat: Seat,
+        #[serde(default = "default_play_reveal_secs")]
+        reveal_secs: u32,
+    },
+    /// Server forced pass/play because the turn timer expired.
+    TurnTimeout {
         seat: Seat,
     },
     PlayerOut {
@@ -163,6 +175,14 @@ pub struct PublicPlay {
     pub cards: Vec<Card>,
     pub hand_type: HandType,
     pub key: Rank,
+}
+
+fn default_turn_timeout_secs() -> u32 {
+    30
+}
+
+fn default_play_reveal_secs() -> u32 {
+    3
 }
 
 pub fn encode_client(msg: &ClientMessage) -> Result<String, serde_json::Error> {

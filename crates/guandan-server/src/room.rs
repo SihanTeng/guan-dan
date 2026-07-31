@@ -1,4 +1,6 @@
-//! Room and in-game match hosting.
+//! Room and in-game match hosting (with turn timer + play reveal).
+
+use std::time::{Duration, Instant};
 
 use guandan_bot::decide_play;
 use guandan_core::{team_of, Action, Event, Match, MatchPhase, Seat};
@@ -6,6 +8,8 @@ use guandan_protocol::{PublicPlay, SeatInfo, ServerMessage};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use uuid::Uuid;
+
+use crate::settings::GameSettings;
 
 #[derive(Debug, Clone)]
 pub struct PlayerSlot {
@@ -20,10 +24,15 @@ pub struct Room {
     pub slots: [PlayerSlot; 4],
     pub game: Option<Match>,
     pub rng: StdRng,
+    pub settings: GameSettings,
+    /// When the current turn expires (server-side).
+    pub turn_deadline: Option<Instant>,
+    /// Bots (and next acts) wait until this so players can see the last play.
+    pub reveal_until: Option<Instant>,
 }
 
 impl Room {
-    pub fn new(id: String, _practice: bool) -> Self {
+    pub fn new(id: String, _practice: bool, settings: GameSettings) -> Self {
         Self {
             id,
             slots: std::array::from_fn(|i| PlayerSlot {
@@ -34,6 +43,9 @@ impl Room {
             }),
             game: None,
             rng: StdRng::from_os_rng(),
+            settings,
+            turn_deadline: None,
+            reveal_until: None,
         }
     }
 
@@ -97,7 +109,9 @@ impl Room {
         let mut game = Match::new();
         let events = game.apply(0, Action::Deal, &mut self.rng).expect("deal");
         self.game = Some(game);
-        self.broadcast_events(&events)
+        let msgs = self.broadcast_events(&events);
+        self.note_timing_from_events(&events);
+        msgs
     }
 
     pub fn apply_action(
@@ -109,7 +123,30 @@ impl Room {
         let events = game
             .apply(seat, action, &mut self.rng)
             .map_err(|e| e.to_string())?;
-        Ok(self.broadcast_events(&events))
+        let msgs = self.broadcast_events(&events);
+        self.note_timing_from_events(&events);
+        Ok(msgs)
+    }
+
+    /// Update turn deadline / reveal window from engine events.
+    fn note_timing_from_events(&mut self, events: &[Event]) {
+        let now = Instant::now();
+        for ev in events {
+            match ev {
+                Event::Turn { .. } => {
+                    self.turn_deadline = Some(now + self.settings.turn_timeout);
+                }
+                Event::Played { .. } | Event::Passed { .. } => {
+                    self.reveal_until = Some(now + self.settings.play_reveal);
+                }
+                Event::HandResult { .. } | Event::Dealt { .. } => {
+                    self.turn_deadline = None;
+                    // short beat after deal before first act
+                    self.reveal_until = Some(now + Duration::from_millis(400));
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Messages to send: (Some(session) for private, None for all human seats).
@@ -119,6 +156,8 @@ impl Room {
             Some(g) => g,
             None => return out,
         };
+        let timeout_secs = self.settings.turn_secs();
+        let reveal_secs = self.settings.reveal_secs();
 
         for ev in events {
             match ev {
@@ -139,7 +178,6 @@ impl Room {
                             ));
                         }
                     }
-                    // Also game start snapshot once
                     out.push((
                         None,
                         ServerMessage::GameStart {
@@ -202,6 +240,7 @@ impl Room {
                             seat: *seat,
                             must_lead: *must_lead,
                             last_play,
+                            timeout_secs,
                         },
                     ));
                 }
@@ -213,11 +252,18 @@ impl Room {
                             cards: cards.clone(),
                             hand_type: hand.ty,
                             counts: std::array::from_fn(|i| game.players[i].hand.len()),
+                            reveal_secs,
                         },
                     ));
                 }
                 Event::Passed { seat } => {
-                    out.push((None, ServerMessage::PlayerPass { seat: *seat }));
+                    out.push((
+                        None,
+                        ServerMessage::PlayerPass {
+                            seat: *seat,
+                            reveal_secs,
+                        },
+                    ));
                 }
                 Event::PlayerOut { seat, rank } => {
                     out.push((
@@ -264,61 +310,119 @@ impl Room {
         out
     }
 
+    fn revealing(&self) -> bool {
+        self.reveal_until
+            .map(|t| Instant::now() < t)
+            .unwrap_or(false)
+    }
+
+    /// One bot step if current seat is a bot and reveal window has elapsed.
     pub fn bot_actions(&mut self) -> Vec<(Option<Uuid>, ServerMessage)> {
+        if self.revealing() {
+            return Vec::new();
+        }
         let mut all = Vec::new();
-        // Cap steps so one tick cannot burn the stack / hang the server.
-        for _ in 0..32 {
-            let (phase, current, is_bot) = {
-                let Some(game) = &self.game else {
-                    return all;
-                };
-                if game.phase != MatchPhase::Playing && game.phase != MatchPhase::Tribute {
-                    return all;
-                }
-                let cur = game.current;
-                let bot = self.slots[cur].is_bot;
-                (game.phase, cur, bot)
+        // At most one bot action per tick so reveal delay applies between plays.
+        let (phase, current, is_bot) = {
+            let Some(game) = &self.game else {
+                return all;
             };
-            if !is_bot {
-                break;
+            if game.phase != MatchPhase::Playing && game.phase != MatchPhase::Tribute {
+                return all;
             }
-            let decision = {
-                let game = self.game.as_ref().unwrap();
-                decide_play(game, current)
-            };
-            let action = if phase == MatchPhase::Tribute {
-                if let Some((card_id, to_seat)) = decision.return_tribute {
-                    Action::ReturnTribute { card_id, to_seat }
-                } else {
-                    break;
-                }
-            } else if decision.pass {
-                Action::Pass
-            } else if let Some(cards) = decision.play {
-                Action::Play {
-                    card_ids: cards.iter().map(|c| c.id).collect(),
-                }
+            let cur = game.current;
+            let bot = self.slots[cur].is_bot;
+            (game.phase, cur, bot)
+        };
+        if !is_bot {
+            return all;
+        }
+        let decision = {
+            let game = self.game.as_ref().unwrap();
+            decide_play(game, current)
+        };
+        let action = if phase == MatchPhase::Tribute {
+            if let Some((card_id, to_seat)) = decision.return_tribute {
+                Action::ReturnTribute { card_id, to_seat }
             } else {
-                break;
-            };
-            match self.apply_action(current, action) {
-                Ok(msgs) => {
-                    all.extend(msgs);
-                    // continue if next is also bot
-                }
-                Err(e) => {
-                    tracing::warn!("bot action failed seat={current}: {e}");
-                    // force pass if possible
-                    if phase == MatchPhase::Playing {
-                        if let Ok(msgs) = self.apply_action(current, Action::Pass) {
-                            all.extend(msgs);
-                        }
+                return all;
+            }
+        } else if decision.pass {
+            Action::Pass
+        } else if let Some(cards) = decision.play {
+            Action::Play {
+                card_ids: cards.iter().map(|c| c.id).collect(),
+            }
+        } else {
+            return all;
+        };
+        match self.apply_action(current, action) {
+            Ok(msgs) => all.extend(msgs),
+            Err(e) => {
+                tracing::warn!("bot action failed seat={current}: {e}");
+                if phase == MatchPhase::Playing {
+                    if let Ok(msgs) = self.apply_action(current, Action::Pass) {
+                        all.extend(msgs);
                     }
-                    break;
                 }
             }
         }
         all
+    }
+
+    /// Force pass (or lead) when the standard turn timer expires.
+    pub fn check_turn_timeout(&mut self) -> Vec<(Option<Uuid>, ServerMessage)> {
+        if self.revealing() {
+            return Vec::new();
+        }
+        let Some(deadline) = self.turn_deadline else {
+            return Vec::new();
+        };
+        if Instant::now() < deadline {
+            return Vec::new();
+        }
+        let Some(game) = &self.game else {
+            return Vec::new();
+        };
+        if game.phase != MatchPhase::Playing && game.phase != MatchPhase::Tribute {
+            return Vec::new();
+        }
+        let seat = game.current;
+        // Don't timeout bots here — bot tick handles them (but still enforce if stuck).
+        let mut out = vec![(None, ServerMessage::TurnTimeout { seat })];
+
+        let action = if game.phase == MatchPhase::Tribute {
+            let decision = decide_play(game, seat);
+            if let Some((card_id, to_seat)) = decision.return_tribute {
+                Action::ReturnTribute { card_id, to_seat }
+            } else {
+                return out;
+            }
+        } else if game.last_play.is_none() {
+            // Must lead: play smallest legal set
+            let decision = decide_play(game, seat);
+            if let Some(cards) = decision.play {
+                Action::Play {
+                    card_ids: cards.iter().map(|c| c.id).collect(),
+                }
+            } else {
+                return out;
+            }
+        } else {
+            Action::Pass
+        };
+
+        match self.apply_action(seat, action) {
+            Ok(msgs) => {
+                out.extend(msgs);
+            }
+            Err(e) => {
+                tracing::warn!("turn timeout action failed seat={seat}: {e}");
+                // Clear deadline so we don't loop-spam
+                self.turn_deadline = Some(Instant::now() + self.settings.turn_timeout);
+            }
+        }
+        out
     }
 
     /// After hand over, auto-deal next hand for continuous play.
@@ -330,9 +434,16 @@ impl Room {
         if !need {
             return Vec::new();
         }
+        if self.revealing() {
+            return Vec::new();
+        }
         let game = self.game.as_mut().unwrap();
         match game.apply(0, Action::Deal, &mut self.rng) {
-            Ok(events) => self.broadcast_events(&events),
+            Ok(events) => {
+                let msgs = self.broadcast_events(&events);
+                self.note_timing_from_events(&events);
+                msgs
+            }
             Err(e) => {
                 tracing::warn!("auto deal failed: {e}");
                 Vec::new()

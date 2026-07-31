@@ -1,15 +1,18 @@
 //! Guandan WebSocket game server.
 
 mod room;
+mod settings;
 mod state;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use guandan_protocol::{decode_client, encode_server, ServerMessage};
+use settings::GameSettings;
 use state::AppState;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -23,6 +26,12 @@ struct Args {
     /// Listen address
     #[arg(long, default_value = "0.0.0.0:9100")]
     bind: String,
+    /// Turn time limit in seconds (auto-pass / auto-lead). Standard: 30.
+    #[arg(long, default_value_t = 30, env = "GUANDAN_TURN_SECS")]
+    turn_timeout_secs: u64,
+    /// Seconds to hold a play on screen before the next seat acts. Standard: 3.
+    #[arg(long, default_value_t = 3, env = "GUANDAN_REVEAL_SECS")]
+    play_reveal_secs: u64,
 }
 
 #[tokio::main]
@@ -35,16 +44,23 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let state = Arc::new(AppState::new());
+    let settings = GameSettings {
+        turn_timeout: Duration::from_secs(args.turn_timeout_secs.max(5)),
+        play_reveal: Duration::from_secs(args.play_reveal_secs),
+    };
+    let state = Arc::new(AppState::new(settings));
     let listener = TcpListener::bind(&args.bind).await?;
-    info!("掼蛋服务器监听 {}", args.bind);
+    info!(
+        "掼蛋服务器监听 {}  ·  turn={}s  reveal={}s",
+        args.bind, args.turn_timeout_secs, args.play_reveal_secs
+    );
 
-    // Bot tick loop
-    let bot_state = Arc::clone(&state);
+    // Game tick: turn timeouts + bots (respecting play reveal)
+    let tick_state = Arc::clone(&state);
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-            bot_state.tick_bots().await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tick_state.tick_game().await;
         }
     });
 

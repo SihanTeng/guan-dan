@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 use crate::room::Room;
+use crate::settings::GameSettings;
 
 pub type OutTx = mpsc::UnboundedSender<String>;
 
@@ -26,15 +27,17 @@ pub struct AppState {
     rooms: Mutex<HashMap<String, Room>>,
     room_seq: AtomicU64,
     quick_queue: Mutex<Vec<Uuid>>,
+    pub settings: GameSettings,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(settings: GameSettings) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             rooms: Mutex::new(HashMap::new()),
             room_seq: AtomicU64::new(1),
             quick_queue: Mutex::new(Vec::new()),
+            settings,
         }
     }
 
@@ -125,7 +128,7 @@ impl AppState {
                     }
                 }
                 let rid = format!("R{}", self.room_seq.fetch_add(1, Ordering::SeqCst));
-                let mut room = Room::new(rid.clone(), false);
+                let mut room = Room::new(rid.clone(), false, self.settings);
                 let seat = room
                     .join(session_id, self.name_of(session_id).await)
                     .unwrap();
@@ -190,7 +193,7 @@ impl AppState {
             }
             ClientMessage::PracticeMatch => {
                 let rid = format!("P{}", self.room_seq.fetch_add(1, Ordering::SeqCst));
-                let mut room = Room::new(rid.clone(), true);
+                let mut room = Room::new(rid.clone(), true, self.settings);
                 let name = self.name_of(session_id).await;
                 let seat = room.join(session_id, name).unwrap();
                 room.fill_bots();
@@ -205,7 +208,7 @@ impl AppState {
                 }
                 let infos = room.seat_infos();
                 let msgs = room.start_game();
-                let bot_msgs = room.bot_actions();
+                // Bots wait for reveal/turn tick so plays are visible.
                 self.rooms.lock().await.insert(rid.clone(), room);
                 let t = encode_server(&ServerMessage::MatchFound {
                     room_id: rid.clone(),
@@ -219,7 +222,6 @@ impl AppState {
                 })?;
                 self.send_to(session_id, t).await?;
                 self.dispatch_stored(&rid, msgs).await;
-                self.dispatch_stored(&rid, bot_msgs).await;
             }
             ClientMessage::QuickMatch => {
                 let mut q = self.quick_queue.lock().await;
@@ -376,12 +378,8 @@ impl AppState {
 
         if room.all_ready() && room.game.is_none() {
             let msgs = room.start_game();
-            let bot_msgs = room.bot_actions();
-            let cont = room.maybe_continue();
             drop(rooms);
             self.dispatch_stored(&room_id, msgs).await;
-            self.dispatch_stored(&room_id, bot_msgs).await;
-            self.dispatch_stored(&room_id, cont).await;
         }
         Ok(())
     }
@@ -401,23 +399,18 @@ impl AppState {
         let seat = room
             .seat_of(session_id)
             .ok_or_else(|| anyhow::anyhow!("无座位"))?;
+        // Human action only; bots follow after play_reveal via tick_game.
         let msgs = room
             .apply_action(seat, action)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let bot_msgs = room.bot_actions();
-        let cont = room.maybe_continue();
-        let more_bots = room.bot_actions();
         drop(rooms);
         self.dispatch_stored(&room_id, msgs).await;
-        self.dispatch_stored(&room_id, bot_msgs).await;
-        self.dispatch_stored(&room_id, cont).await;
-        self.dispatch_stored(&room_id, more_bots).await;
         Ok(())
     }
 
     async fn make_quick_room(&self, players: Vec<Uuid>) -> Result<()> {
         let rid = format!("Q{}", self.room_seq.fetch_add(1, Ordering::SeqCst));
-        let mut room = Room::new(rid.clone(), false);
+        let mut room = Room::new(rid.clone(), false, self.settings);
         for pid in &players {
             let name = self.name_of(*pid).await;
             room.join(*pid, name);
@@ -435,7 +428,6 @@ impl AppState {
         room.fill_bots();
         let infos = room.seat_infos();
         let msgs = room.start_game();
-        let bot_msgs = room.bot_actions();
         self.rooms.lock().await.insert(rid.clone(), room);
         for (i, pid) in players.iter().enumerate() {
             let t = encode_server(&ServerMessage::MatchFound {
@@ -451,11 +443,11 @@ impl AppState {
             self.send_to(*pid, t).await?;
         }
         self.dispatch_stored(&rid, msgs).await;
-        self.dispatch_stored(&rid, bot_msgs).await;
         Ok(())
     }
 
-    pub async fn tick_bots(&self) {
+    /// Periodic: turn timeouts, bot steps (respecting play reveal), hand continue.
+    pub async fn tick_game(&self) {
         let room_ids: Vec<String> = self.rooms.lock().await.keys().cloned().collect();
         for rid in room_ids {
             let mut rooms = self.rooms.lock().await;
@@ -465,14 +457,14 @@ impl AppState {
             if room.game.is_none() {
                 continue;
             }
-            let msgs = room.bot_actions();
+            let timeout_msgs = room.check_turn_timeout();
+            let bot_msgs = room.bot_actions();
             let cont = room.maybe_continue();
-            let more = room.bot_actions();
             drop(rooms);
-            if !msgs.is_empty() || !cont.is_empty() || !more.is_empty() {
-                self.dispatch_stored(&rid, msgs).await;
+            if !timeout_msgs.is_empty() || !bot_msgs.is_empty() || !cont.is_empty() {
+                self.dispatch_stored(&rid, timeout_msgs).await;
+                self.dispatch_stored(&rid, bot_msgs).await;
                 self.dispatch_stored(&rid, cont).await;
-                self.dispatch_stored(&rid, more).await;
             }
         }
     }

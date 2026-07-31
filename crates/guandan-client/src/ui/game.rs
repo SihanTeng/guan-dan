@@ -45,16 +45,21 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status_strip(f: &mut Frame, app: &App, area: Rect) {
+    let timer = app
+        .turn_secs_left()
+        .map(|s| format!("  {s:2}s  "))
+        .unwrap_or_else(|| "  --  ".into());
+
     let turn = match app.current {
         Some(s) if s == app.my_seat => Span::styled(
-            "  your turn  ",
+            format!("  your turn {timer}"),
             Style::default()
                 .fg(BG)
                 .bg(TURN)
                 .add_modifier(Modifier::BOLD),
         ),
         Some(s) => Span::styled(
-            format!("  wait {}  ", app.seat_name(s)),
+            format!("  {} {} ", app.seat_name(s), timer.trim()),
             Style::default().fg(MUTED).bg(BG),
         ),
         None => Span::raw(""),
@@ -133,17 +138,33 @@ fn seat_line(f: &mut Frame, app: &App, area: Rect, seat: usize, label: &str) {
 
 fn draw_play(f: &mut Frame, app: &App, area: Rect) {
     let is_my = app.current == Some(app.my_seat);
-    let border = if is_my {
+    let revealing = app.revealing();
+    let border = if revealing {
+        Style::default().fg(ACCENT).bg(SURFACE)
+    } else if is_my {
         theme::active_border()
     } else {
         theme::panel_border()
     };
 
     let title = if let Some(ref lp) = app.last_play {
+        let hold = if revealing {
+            let left = app
+                .reveal_until
+                .map(|t| {
+                    t.saturating_duration_since(std::time::Instant::now())
+                        .as_secs()
+                })
+                .unwrap_or(0);
+            format!("  ·  展示 {left}s ")
+        } else {
+            String::new()
+        };
         format!(
-            " {} · {} ",
+            " {} · {}{} ",
             app.seat_name(lp.seat),
-            hand_type_cn(lp.hand_type)
+            hand_type_cn(lp.hand_type),
+            hold
         )
     } else {
         " 出牌 ".into()
@@ -153,7 +174,17 @@ fn draw_play(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border)
         .style(theme::surface())
-        .title(Span::styled(title, theme::panel_title()));
+        .title(Span::styled(
+            title,
+            if revealing {
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(SURFACE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme::panel_title()
+            },
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 

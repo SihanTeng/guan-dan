@@ -1,4 +1,4 @@
-//! In-game felt table layout.
+//! In-game layout — flat hierarchy, one focus at a time.
 
 use guandan_core::TeamId;
 use ratatui::buffer::Buffer;
@@ -8,233 +8,130 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui::Frame;
 
-use super::cards::{self, card_backs_line, card_strip_lines, render_card_grid, CARD_H};
-use super::theme::{self, ACCENT, FELT_DARK, MUTED, PAPER, TURN_GLOW};
+use super::cards::{self, card_strip_lines, render_card_grid, CARD_H};
+use super::theme::{self, ACCENT, BG, MUTED, SURFACE, TEXT, TURN};
 use crate::app::{hand_type_cn, App};
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
+    let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
-            Constraint::Length(5), // partner
-            Constraint::Length(8), // left | play | right
-            Constraint::Min(6),    // hand
-            Constraint::Length(2), // footer
+            Constraint::Length(1), // status strip (no box)
+            Constraint::Length(1), // spacer
+            Constraint::Length(2), // opponents row
+            Constraint::Length(1),
+            Constraint::Length(4), // last play
+            Constraint::Length(1),
+            Constraint::Min(5),    // hand
+            Constraint::Length(2), // input / hints
         ])
+        .margin(1)
         .split(area);
 
-    draw_header(f, app, chunks[0]);
-    draw_partner(f, app, chunks[1]);
-    draw_middle(f, app, chunks[2]);
-    draw_hand(f, app, chunks[3]);
-    draw_footer(f, app, chunks[4]);
+    draw_status_strip(f, app, root[0]);
+    draw_opponents(f, app, root[2]);
+    draw_play(f, app, root[4]);
+    draw_hand(f, app, root[6]);
+    draw_input(f, app, root[7]);
 
     if app.screen == crate::app::Screen::HandResult {
         super::draw_popup(
             f,
             area,
-            " 本局结果 ",
-            &format!("{}\n\nEnter 继续下一局", app.last_hand_result),
+            "本局",
+            &format!("{}\n\nEnter 继续", app.last_hand_result),
         );
     }
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let my_team = app
-        .seats
-        .iter()
-        .find(|s| s.seat == app.my_seat)
-        .map(|s| s.team)
-        .unwrap_or(TeamId::A);
-    let team_label = match my_team {
-        TeamId::A => "队A",
-        TeamId::B => "队B",
-    };
-
+fn draw_status_strip(f: &mut Frame, app: &App, area: Rect) {
     let turn = match app.current {
         Some(s) if s == app.my_seat => Span::styled(
-            "  ★ 轮到你  ",
+            "  your turn  ",
             Style::default()
-                .fg(FELT_DARK)
-                .bg(TURN_GLOW)
+                .fg(BG)
+                .bg(TURN)
                 .add_modifier(Modifier::BOLD),
         ),
         Some(s) => Span::styled(
-            format!("  等待 {}  ", app.seat_name(s)),
-            Style::default().fg(MUTED).bg(FELT_DARK),
+            format!("  wait {}  ", app.seat_name(s)),
+            Style::default().fg(MUTED).bg(BG),
         ),
         None => Span::raw(""),
     };
 
     let line = Line::from(vec![
-        Span::styled(" 级牌 ", Style::default().fg(MUTED).bg(FELT_DARK)),
+        Span::styled(" 级 ", Style::default().fg(MUTED).bg(BG)),
         Span::styled(
-            format!(" {} ", app.hand_level.label()),
+            format!("{} ", app.hand_level.label()),
             Style::default()
-                .fg(FELT_DARK)
-                .bg(ACCENT)
+                .fg(TEXT)
+                .bg(BG)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ", theme::panel()),
-        Span::styled("A ", Style::default().fg(theme::CYAN).bg(FELT_DARK)),
         Span::styled(
-            format!("{} ", app.team_levels[0].label()),
-            Style::default().fg(PAPER).bg(FELT_DARK),
-        ),
-        Span::styled("B ", Style::default().fg(theme::DANGER).bg(FELT_DARK)),
-        Span::styled(
-            format!("{} ", app.team_levels[1].label()),
-            Style::default().fg(PAPER).bg(FELT_DARK),
+            format!(
+                " A:{}  B:{}  ",
+                app.team_levels[0].label(),
+                app.team_levels[1].label()
+            ),
+            Style::default().fg(MUTED).bg(BG),
         ),
         Span::styled(
-            format!(" 你:{team_label}  "),
-            Style::default().fg(MUTED).bg(FELT_DARK),
+            format!("{}  ", app.room_id.as_deref().unwrap_or("")),
+            Style::default().fg(MUTED).bg(BG),
         ),
-        Span::styled(
-            format!(" {} ", app.room_id.as_deref().unwrap_or("-")),
-            Style::default().fg(MUTED).bg(FELT_DARK),
-        ),
-        Span::raw("  "),
         turn,
     ]);
+    f.render_widget(Paragraph::new(line), area);
+}
 
+fn draw_opponents(f: &mut Frame, app: &App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(28),
+            Constraint::Percentage(44),
+            Constraint::Percentage(28),
+        ])
+        .split(area);
+
+    seat_line(f, app, cols[0], app.relative_seat(1), "左");
+    seat_line(f, app, cols[1], app.relative_seat(2), "对家");
+    seat_line(f, app, cols[2], app.relative_seat(3), "右");
+}
+
+fn seat_line(f: &mut Frame, app: &App, area: Rect, seat: usize, label: &str) {
+    let count = app.counts.get(seat).copied().unwrap_or(0);
+    let active = app.current == Some(seat);
+    let name = app.seat_name(seat);
+    let team = app
+        .seats
+        .iter()
+        .find(|s| s.seat == seat)
+        .map(|s| match s.team {
+            TeamId::A => "A",
+            TeamId::B => "B",
+        })
+        .unwrap_or("-");
+
+    let style = if active {
+        Style::default()
+            .fg(ACCENT)
+            .bg(BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED).bg(BG)
+    };
+
+    let text = format!("{label}  {name}  [{team}]  ·  {count}");
     f.render_widget(
-        Paragraph::new(line).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme::panel_border())
-                .style(theme::panel())
-                .title(Span::styled(" 掼蛋 ", theme::panel_title())),
-        ),
+        Paragraph::new(Span::styled(text, style)).alignment(Alignment::Center),
         area,
     );
 }
 
-fn draw_partner(f: &mut Frame, app: &App, area: Rect) {
-    let seat = app.relative_seat(2);
-    let block = seat_block(app, seat, "对家 · Partner", true);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let count = app.counts.get(seat).copied().unwrap_or(0);
-    let lines = vec![
-        Line::from(Span::styled(
-            format!("  {}  ", app.seat_name(seat)),
-            Style::default()
-                .fg(PAPER)
-                .bg(FELT_DARK)
-                .add_modifier(Modifier::BOLD),
-        )),
-        card_backs_line(count),
-        Line::from(Span::styled(
-            format!("  剩 {count} 张  "),
-            Style::default().fg(MUTED).bg(FELT_DARK),
-        )),
-    ];
-    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
-}
-
-fn draw_middle(f: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(22),
-            Constraint::Percentage(56),
-            Constraint::Percentage(22),
-        ])
-        .split(area);
-
-    draw_side_seat(f, app, cols[0], app.relative_seat(1), "左 · Left");
-    draw_play_area(f, app, cols[1]);
-    draw_side_seat(f, app, cols[2], app.relative_seat(3), "右 · Right");
-}
-
-fn draw_side_seat(f: &mut Frame, app: &App, area: Rect, seat: usize, label: &str) {
-    let block = seat_block(app, seat, label, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let count = app.counts.get(seat).copied().unwrap_or(0);
-    let team = team_badge(app, seat);
-    let lines = vec![
-        Line::from(Span::styled(
-            format!(" {}", app.seat_name(seat)),
-            Style::default().fg(PAPER).bg(FELT_DARK),
-        )),
-        Line::from(team),
-        card_backs_line(count.min(6)),
-        Line::from(Span::styled(
-            format!(" 剩{count}"),
-            Style::default().fg(MUTED).bg(FELT_DARK),
-        )),
-    ];
-    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
-}
-
-fn draw_play_area(f: &mut Frame, app: &App, area: Rect) {
-    let is_my_turn = app.current == Some(app.my_seat);
-    let border = if is_my_turn {
-        theme::active_border()
-    } else {
-        theme::panel_border()
-    };
-
-    let title = if let Some(ref lp) = app.last_play {
-        format!(
-            " 出牌 · {} · {} ",
-            app.seat_name(lp.seat),
-            hand_type_cn(lp.hand_type)
-        )
-    } else {
-        " 出牌区 · 自由出牌 ".into()
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border)
-        .style(theme::panel())
-        .title(Span::styled(title, theme::panel_title()));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if let Some(ref lp) = app.last_play {
-        let mut lines = card_strip_lines(&lp.cards, app.hand_level);
-        lines.insert(
-            0,
-            Line::from(Span::styled(
-                format!("  {}  ", hand_type_cn(lp.hand_type)),
-                Style::default()
-                    .fg(ACCENT)
-                    .bg(FELT_DARK)
-                    .add_modifier(Modifier::BOLD),
-            )),
-        );
-        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
-    } else {
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  等待首出…  ",
-                    Style::default().fg(MUTED).bg(FELT_DARK),
-                )),
-            ])
-            .alignment(Alignment::Center),
-            inner,
-        );
-    }
-}
-
-fn draw_hand(f: &mut Frame, app: &App, area: Rect) {
-    let n = app.hand.len();
-    let sel: usize = app.selected.iter().filter(|s| **s).count();
-    let title = if app.tribute_mode {
-        format!(" 回贡 · 选 1 张 ≤10  ·  手牌 {n} ")
-    } else {
-        format!(" 我的手牌  {n} 张 · 已选 {sel} ")
-    };
-
+fn draw_play(f: &mut Frame, app: &App, area: Rect) {
     let is_my = app.current == Some(app.my_seat);
     let border = if is_my {
         theme::active_border()
@@ -242,48 +139,67 @@ fn draw_hand(f: &mut Frame, app: &App, area: Rect) {
         theme::panel_border()
     };
 
-    // Input strip: typed ranks (ddz-style) or visual-select hint
-    let input_line = if !app.play_buf.is_empty() {
+    let title = if let Some(ref lp) = app.last_play {
         format!(
-            " 输入: {}▌  Enter 出牌  Backspace 删  Esc 清空 ",
-            app.play_buf
+            " {} · {} ",
+            app.seat_name(lp.seat),
+            hand_type_cn(lp.hand_type)
         )
     } else {
-        " ←→ 光标  Space 点选  键入点数如 34567/KK  Enter 出  P 不出  Esc 清空 ".into()
+        " 出牌 ".into()
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border)
-        .style(theme::panel())
-        .title(Span::styled(title, theme::panel_title()))
-        .title_bottom(Span::styled(
-            input_line,
-            if app.play_buf.is_empty() {
-                Style::default().fg(MUTED).bg(FELT_DARK)
-            } else {
-                Style::default()
-                    .fg(FELT_DARK)
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            },
-        ));
+        .style(theme::surface())
+        .title(Span::styled(title, theme::panel_title()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(ref lp) = app.last_play {
+        let lines = card_strip_lines(&lp.cards, app.hand_level);
+        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+    } else {
+        f.render_widget(
+            Paragraph::new(Span::styled("—", Style::default().fg(MUTED).bg(SURFACE)))
+                .alignment(Alignment::Center),
+            inner,
+        );
+    }
+}
+
+fn draw_hand(f: &mut Frame, app: &App, area: Rect) {
+    let n = app.hand.len();
+    let sel = app.selected.iter().filter(|s| **s).count();
+    let title = if app.tribute_mode {
+        format!(" 回贡  ·  {n} ")
+    } else {
+        format!(" 手牌  {n}  ·  选 {sel} ")
+    };
+
+    let is_my = app.current == Some(app.my_seat);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if is_my {
+            theme::active_border()
+        } else {
+            theme::panel_border()
+        })
+        .style(theme::surface())
+        .title(Span::styled(title, theme::panel_title()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if app.hand.is_empty() {
         f.render_widget(
-            Paragraph::new(Span::styled(
-                "（已出完）",
-                Style::default().fg(MUTED).bg(FELT_DARK),
-            ))
-            .alignment(Alignment::Center),
+            Paragraph::new(Span::styled("—", Style::default().fg(MUTED).bg(SURFACE)))
+                .alignment(Alignment::Center),
             inner,
         );
         return;
     }
 
-    // Custom widget for card grid
     let cards: Vec<_> = app
         .hand
         .iter()
@@ -297,11 +213,13 @@ fn draw_hand(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let widget = HandGrid {
-        cards,
-        level: app.hand_level,
-    };
-    f.render_widget(widget, inner);
+    f.render_widget(
+        HandGrid {
+            cards,
+            level: app.hand_level,
+        },
+        inner,
+    );
 }
 
 struct HandGrid {
@@ -311,82 +229,50 @@ struct HandGrid {
 
 impl Widget for HandGrid {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // Center horizontally if few cards
         let gap = 0u16;
         let per_row = ((area.width + gap) / (cards::CARD_W + gap)).max(1) as usize;
         let rows = self.cards.len().div_ceil(per_row).max(1) as u16;
         let used_h = rows * CARD_H;
         let y_off = area.height.saturating_sub(used_h) / 2;
-
-        let first_row_n = per_row.min(self.cards.len());
-        let used_w = first_row_n as u16 * cards::CARD_W;
+        let first = per_row.min(self.cards.len()) as u16;
+        let used_w = first * cards::CARD_W;
         let x_off = area.width.saturating_sub(used_w) / 2;
-
-        let grid = Rect::new(
-            area.x + x_off,
-            area.y + y_off,
-            area.width.saturating_sub(x_off),
-            area.height.saturating_sub(y_off),
+        render_card_grid(
+            buf,
+            Rect::new(
+                area.x + x_off,
+                area.y + y_off,
+                area.width.saturating_sub(x_off),
+                area.height.saturating_sub(y_off),
+            ),
+            &self.cards,
+            self.level,
+            gap,
         );
-        render_card_grid(buf, grid, &self.cards, self.level, gap);
     }
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let text = if app.show_counter {
-        format!(
-            " 记牌  #1:{}  #2:{}  #3:{}  #4:{}   (C 关闭)",
-            app.counts[0], app.counts[1], app.counts[2], app.counts[3]
-        )
-    } else {
-        " C 记牌  ·  H 帮助  ·  出牌: 键入 3-9 T/0/10 J Q K A 2 B R 后 Enter  ·  逢人配 * ".into()
-    };
-    f.render_widget(
-        Paragraph::new(Span::styled(text, theme::muted_on_felt())).alignment(Alignment::Center),
-        area,
-    );
-}
-
-fn seat_block<'a>(app: &'a App, seat: usize, label: &'a str, _wide: bool) -> Block<'a> {
-    let active = app.current == Some(seat);
-    let border = if active {
-        theme::active_border()
-    } else {
-        theme::panel_border()
-    };
-    let mark = if active { " ● " } else { " " };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(border)
-        .style(theme::panel())
-        .title(Span::styled(
-            format!("{mark}{label}{mark}"),
-            if active {
+fn draw_input(f: &mut Frame, app: &App, area: Rect) {
+    let line = if !app.play_buf.is_empty() {
+        Line::from(vec![
+            Span::styled("  › ", Style::default().fg(ACCENT).bg(BG)),
+            Span::styled(
+                format!("{}▌", app.play_buf),
                 Style::default()
-                    .fg(FELT_DARK)
-                    .bg(TURN_GLOW)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                theme::panel_title()
-            },
+                    .fg(TEXT)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "   Enter 出牌   ⌫ 删   Esc 清空",
+                Style::default().fg(MUTED).bg(BG),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "  键入点数 34567 / KK    Enter 出    P 过    ←→ Space 点选    H 帮助",
+            Style::default().fg(MUTED).bg(BG),
         ))
-}
-
-fn team_badge(app: &App, seat: usize) -> Span<'static> {
-    let (label, color) = app
-        .seats
-        .iter()
-        .find(|s| s.seat == seat)
-        .map(|s| match s.team {
-            TeamId::A => ("队A", theme::CYAN),
-            TeamId::B => ("队B", theme::DANGER),
-        })
-        .unwrap_or(("?", MUTED));
-    Span::styled(
-        format!(" {label} "),
-        Style::default()
-            .fg(color)
-            .bg(FELT_DARK)
-            .add_modifier(Modifier::BOLD),
-    )
+    };
+    f.render_widget(Paragraph::new(line), area);
 }

@@ -134,10 +134,10 @@ impl Room {
         for ev in events {
             match ev {
                 Event::Turn { .. } => {
-                    self.turn_deadline = Some(now + self.settings.turn_timeout);
+                    self.turn_deadline = Some(now + self.settings.turn_timeout());
                 }
                 Event::Played { .. } | Event::Passed { .. } => {
-                    self.reveal_until = Some(now + self.settings.play_reveal);
+                    self.reveal_until = Some(now + self.settings.play_reveal());
                 }
                 Event::HandResult { .. } | Event::Dealt { .. } => {
                     self.turn_deadline = None;
@@ -419,7 +419,7 @@ impl Room {
             Err(e) => {
                 tracing::warn!("turn timeout action failed seat={seat}: {e}");
                 // Clear deadline so we don't loop-spam
-                self.turn_deadline = Some(Instant::now() + self.settings.turn_timeout);
+                self.turn_deadline = Some(Instant::now() + self.settings.turn_timeout());
             }
         }
         out

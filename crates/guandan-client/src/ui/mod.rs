@@ -59,14 +59,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
   Enter 出  P 过  ⌫ 删  Esc 清空
   ←→ Space 点选
 
-计时
-  每回合限时 30 秒（超时自动过 / 首出最小牌）
-  他人出牌展示 3 秒（可配置）
-
-配置 ~/.config/guandan/settings.toml
-  play_reveal_secs = 3
-  turn_timeout_secs = 30
-  或: guandan --play-reveal-secs 3 --save-settings
+计时（固定）
+  每回合 30 秒（超时自动过 / 首出最小牌）
+  他人出牌展示 3 秒
 
 H / Esc  关闭";
     draw_popup(f, area, "帮助", text);

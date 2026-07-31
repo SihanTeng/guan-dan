@@ -4,6 +4,11 @@ use guandan_core::{Card, FinishRank, HandType, Rank, Seat, TeamId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Fixed turn time limit (seconds). Not configurable.
+pub const TURN_TIMEOUT_SECS: u32 = 30;
+/// Fixed hold time after a play so others can see it (seconds). Not configurable.
+pub const PLAY_REVEAL_SECS: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     pub ty: String,
@@ -107,7 +112,7 @@ pub enum ServerMessage {
         seat: Seat,
         must_lead: bool,
         last_play: Option<PublicPlay>,
-        /// Turn time limit in seconds (server standard timer).
+        /// Always [`TURN_TIMEOUT_SECS`] (30); kept for older clients / UI.
         #[serde(default = "default_turn_timeout_secs")]
         timeout_secs: u32,
     },
@@ -116,7 +121,7 @@ pub enum ServerMessage {
         cards: Vec<Card>,
         hand_type: HandType,
         counts: [usize; 4],
-        /// How long clients should hold this play on screen (seconds).
+        /// Always [`PLAY_REVEAL_SECS`] (3).
         #[serde(default = "default_play_reveal_secs")]
         reveal_secs: u32,
     },
@@ -178,11 +183,11 @@ pub struct PublicPlay {
 }
 
 fn default_turn_timeout_secs() -> u32 {
-    30
+    TURN_TIMEOUT_SECS
 }
 
 fn default_play_reveal_secs() -> u32 {
-    3
+    PLAY_REVEAL_SECS
 }
 
 pub fn encode_client(msg: &ClientMessage) -> Result<String, serde_json::Error> {

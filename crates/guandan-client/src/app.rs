@@ -6,11 +6,12 @@ use crossterm::event::KeyCode;
 use guandan_core::{
     find_card_indices_in_hand, find_cards_in_hand, Card, FinishRank, HandType, Rank, Seat, TeamId,
 };
-use guandan_protocol::{ClientMessage, PublicPlay, SeatInfo, ServerMessage};
+use guandan_protocol::{
+    ClientMessage, PublicPlay, SeatInfo, ServerMessage, PLAY_REVEAL_SECS, TURN_TIMEOUT_SECS,
+};
 use uuid::Uuid;
 
 use crate::net::NetHandle;
-use crate::settings::Settings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -53,11 +54,9 @@ pub struct App {
     pub tribute_payers: Vec<Seat>,
     /// Typed rank sequence for play, e.g. `"34567"` / `"KK"` / `"3334"` (ddz-style).
     pub play_buf: String,
-    pub settings: Settings,
-    /// When the current turn ends (local Instant, from server timeout_secs).
+    /// When the current turn ends (local Instant; always 30s from PlayTurn).
     pub turn_deadline: Option<Instant>,
-    pub turn_timeout_secs: u32,
-    /// Hold last play on screen until this instant (others' 出牌 reveal).
+    /// Hold last play on screen until this instant (fixed 3s reveal).
     pub reveal_until: Option<Instant>,
     /// Seat that just played (for highlight during reveal).
     pub reveal_seat: Option<Seat>,
@@ -73,7 +72,7 @@ pub enum LobbyFocus {
 }
 
 impl App {
-    pub fn new(net: NetHandle, settings: Settings) -> Self {
+    pub fn new(net: NetHandle) -> Self {
         Self {
             net,
             screen: Screen::Lobby,
@@ -104,8 +103,6 @@ impl App {
             tribute_mode: false,
             tribute_payers: Vec::new(),
             play_buf: String::new(),
-            turn_timeout_secs: settings.turn_timeout_secs as u32,
-            settings,
             turn_deadline: None,
             reveal_until: None,
             reveal_seat: None,
@@ -141,20 +138,12 @@ impl App {
             .unwrap_or(false)
     }
 
-    fn start_turn_timer(&mut self, timeout_secs: u32) {
-        let secs = if timeout_secs == 0 {
-            self.settings.turn_timeout_secs as u32
-        } else {
-            timeout_secs
-        };
-        self.turn_timeout_secs = secs;
-        self.turn_deadline = Some(Instant::now() + Duration::from_secs(secs as u64));
+    fn start_turn_timer(&mut self) {
+        self.turn_deadline = Some(Instant::now() + Duration::from_secs(TURN_TIMEOUT_SECS as u64));
     }
 
-    fn start_reveal(&mut self, seat: Seat, _server_reveal_secs: u32) {
-        // Local settings are authoritative for how long we display others' plays.
-        let hold = self.settings.play_reveal_secs.max(1);
-        self.reveal_until = Some(Instant::now() + Duration::from_secs(hold));
+    fn start_reveal(&mut self, seat: Seat) {
+        self.reveal_until = Some(Instant::now() + Duration::from_secs(PLAY_REVEAL_SECS as u64));
         self.reveal_seat = Some(seat);
     }
 
@@ -280,7 +269,7 @@ impl App {
                 seat,
                 must_lead,
                 last_play,
-                timeout_secs,
+                timeout_secs: _,
             } => {
                 self.current = Some(seat);
                 self.must_lead = must_lead;
@@ -288,12 +277,12 @@ impl App {
                 if !self.revealing() && last_play.is_some() {
                     self.last_play = last_play;
                 }
-                self.start_turn_timer(timeout_secs);
+                self.start_turn_timer();
                 if seat == self.my_seat {
                     self.set_status(if must_lead {
-                        format!("轮到你 · {timeout_secs}s")
+                        format!("轮到你 · {TURN_TIMEOUT_SECS}s")
                     } else {
-                        format!("请出牌 · {timeout_secs}s")
+                        format!("请出牌 · {TURN_TIMEOUT_SECS}s")
                     });
                 }
             }
@@ -302,7 +291,7 @@ impl App {
                 cards,
                 hand_type,
                 counts,
-                reveal_secs,
+                reveal_secs: _,
             } => {
                 self.counts = counts;
                 self.last_play = Some(PublicPlay {
@@ -318,23 +307,24 @@ impl App {
                     self.cursor = self.cursor.min(self.hand.len().saturating_sub(1));
                     self.clear_play_input();
                 } else {
-                    // Hold other players' / bots' plays on screen
-                    self.start_reveal(seat, reveal_secs);
+                    self.start_reveal(seat);
                     let name = self.seat_name(seat);
                     self.set_status(format!(
-                        "{} 出了 {} · 展示 {}s",
+                        "{} 出了 {} · 展示 {PLAY_REVEAL_SECS}s",
                         name,
-                        hand_type_cn(hand_type),
-                        self.settings.play_reveal_secs
+                        hand_type_cn(hand_type)
                     ));
                 }
             }
-            ServerMessage::PlayerPass { seat, reveal_secs } => {
+            ServerMessage::PlayerPass {
+                seat,
+                reveal_secs: _,
+            } => {
                 if seat == self.my_seat {
                     self.set_status("不出 · Pass");
                     self.clear_play_input();
                 } else {
-                    self.start_reveal(seat, reveal_secs);
+                    self.start_reveal(seat);
                     self.set_status(format!("{} 不出", self.seat_name(seat)));
                 }
             }

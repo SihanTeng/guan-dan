@@ -1,31 +1,27 @@
-//! Server game timing settings (turn timer + play reveal).
+//! Fixed game timing (not configurable).
 
 use std::time::Duration;
 
-/// Standard Guandan multiplayer timing.
-#[derive(Debug, Clone, Copy)]
-pub struct GameSettings {
-    /// Max seconds per turn before auto-pass / auto-lead (default 30).
-    pub turn_timeout: Duration,
-    /// Hold after a play/pass so others can see it before the next act (default 3s).
-    pub play_reveal: Duration,
-}
+use guandan_protocol::{PLAY_REVEAL_SECS, TURN_TIMEOUT_SECS};
 
-impl Default for GameSettings {
-    fn default() -> Self {
-        Self {
-            turn_timeout: Duration::from_secs(30),
-            play_reveal: Duration::from_secs(3),
-        }
-    }
-}
+/// Standard Guandan multiplayer timing — fixed values only.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GameSettings;
 
 impl GameSettings {
+    pub fn turn_timeout(self) -> Duration {
+        Duration::from_secs(TURN_TIMEOUT_SECS as u64)
+    }
+
+    pub fn play_reveal(self) -> Duration {
+        Duration::from_secs(PLAY_REVEAL_SECS as u64)
+    }
+
     pub fn turn_secs(self) -> u32 {
-        self.turn_timeout.as_secs() as u32
+        TURN_TIMEOUT_SECS
     }
 
     pub fn reveal_secs(self) -> u32 {
-        self.play_reveal.as_secs() as u32
+        PLAY_REVEAL_SECS
     }
 }

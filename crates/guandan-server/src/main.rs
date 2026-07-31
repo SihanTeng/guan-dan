@@ -11,7 +11,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use guandan_protocol::{decode_client, encode_server, ServerMessage};
+use guandan_protocol::{
+    decode_client, encode_server, ServerMessage, PLAY_REVEAL_SECS, TURN_TIMEOUT_SECS,
+};
 use settings::GameSettings;
 use state::AppState;
 use tokio::net::{TcpListener, TcpStream};
@@ -26,12 +28,6 @@ struct Args {
     /// Listen address
     #[arg(long, default_value = "0.0.0.0:9100")]
     bind: String,
-    /// Turn time limit in seconds (auto-pass / auto-lead). Standard: 30.
-    #[arg(long, default_value_t = 30, env = "GUANDAN_TURN_SECS")]
-    turn_timeout_secs: u64,
-    /// Seconds to hold a play on screen before the next seat acts. Standard: 3.
-    #[arg(long, default_value_t = 3, env = "GUANDAN_REVEAL_SECS")]
-    play_reveal_secs: u64,
 }
 
 #[tokio::main]
@@ -44,18 +40,13 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let settings = GameSettings {
-        turn_timeout: Duration::from_secs(args.turn_timeout_secs.max(5)),
-        play_reveal: Duration::from_secs(args.play_reveal_secs),
-    };
-    let state = Arc::new(AppState::new(settings));
+    let state = Arc::new(AppState::new(GameSettings));
     let listener = TcpListener::bind(&args.bind).await?;
     info!(
-        "掼蛋服务器监听 {}  ·  turn={}s  reveal={}s",
-        args.bind, args.turn_timeout_secs, args.play_reveal_secs
+        "掼蛋服务器监听 {}  ·  turn={}s  reveal={}s (fixed)",
+        args.bind, TURN_TIMEOUT_SECS, PLAY_REVEAL_SECS
     );
 
-    // Game tick: turn timeouts + bots (respecting play reveal)
     let tick_state = Arc::clone(&state);
     tokio::spawn(async move {
         loop {
@@ -99,7 +90,6 @@ async fn handle_connection(
         count: online,
     })?);
 
-    // Writer task
     let write_task = tokio::spawn(async move {
         while let Some(text) = rx.recv().await {
             if sink.send(Message::Text(text.into())).await.is_err() {
@@ -108,7 +98,6 @@ async fn handle_connection(
         }
     });
 
-    // Reader loop
     let read_result = async {
         while let Some(msg) = stream.next().await {
             let msg = msg?;
@@ -129,10 +118,7 @@ async fn handle_connection(
                         let _ = state.send_to(session_id, err).await;
                     }
                 },
-                Message::Ping(data) => {
-                    // tungstenite handles most pings; respond with app pong too
-                    let _ = data;
-                }
+                Message::Ping(_) => {}
                 Message::Close(_) => break,
                 _ => {}
             }

@@ -60,6 +60,13 @@ pub struct App {
     pub reveal_until: Option<Instant>,
     /// Seat that just played (for highlight during reveal).
     pub reveal_seat: Option<Seat>,
+    /// Hand result confirm board.
+    pub result_confirmed: [bool; 4],
+    pub result_finish_order: Vec<Seat>,
+    pub result_ranks: Vec<FinishRank>,
+    pub my_result_confirmed: bool,
+    pub can_follow: bool,
+    pub no_legal_play: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +113,12 @@ impl App {
             turn_deadline: None,
             reveal_until: None,
             reveal_seat: None,
+            result_confirmed: [false; 4],
+            result_finish_order: Vec::new(),
+            result_ranks: Vec::new(),
+            my_result_confirmed: false,
+            can_follow: true,
+            no_legal_play: false,
         }
     }
 
@@ -270,20 +283,30 @@ impl App {
                 must_lead,
                 last_play,
                 timeout_secs: _,
+                can_follow,
             } => {
                 self.current = Some(seat);
                 self.must_lead = must_lead;
-                // Keep showing held last play during reveal; otherwise take server snapshot
+                self.can_follow = can_follow;
+                self.no_legal_play = seat == self.my_seat && !must_lead && !can_follow;
                 if !self.revealing() && last_play.is_some() {
                     self.last_play = last_play;
                 }
                 self.start_turn_timer();
                 if seat == self.my_seat {
-                    self.set_status(if must_lead {
-                        format!("轮到你 · {TURN_TIMEOUT_SECS}s")
+                    if self.no_legal_play {
+                        self.set_status(format!("⚠ 无牌可出，请按 P 过  ·  {TURN_TIMEOUT_SECS}s"));
+                    } else if must_lead {
+                        self.set_status(format!("轮到你 · {TURN_TIMEOUT_SECS}s"));
                     } else {
-                        format!("请出牌 · {TURN_TIMEOUT_SECS}s")
-                    });
+                        self.set_status(format!("请出牌 · {TURN_TIMEOUT_SECS}s"));
+                    }
+                }
+            }
+            ServerMessage::NoLegalPlay { seat } => {
+                if seat == self.my_seat {
+                    self.no_legal_play = true;
+                    self.set_status("⚠ 无牌可出 · No legal play — press P");
                 }
             }
             ServerMessage::CardPlayed {
@@ -342,14 +365,21 @@ impl App {
                 self.set_status(format!("座位{} → {name}", seat + 1));
             }
             ServerMessage::HandResult {
+                finish_order,
+                ranks,
                 level_gain,
                 new_levels,
                 winning_team,
                 match_over,
                 winner_team,
+                confirmed,
                 ..
             } => {
                 self.team_levels = new_levels;
+                self.result_finish_order = finish_order;
+                self.result_ranks = ranks;
+                self.result_confirmed = confirmed;
+                self.my_result_confirmed = confirmed.get(self.my_seat).copied().unwrap_or(false);
                 let team = match winning_team {
                     TeamId::A => "队A",
                     TeamId::B => "队B",
@@ -362,6 +392,24 @@ impl App {
                     self.screen = Screen::HandResult;
                 }
             }
+            ServerMessage::ResultConfirmed { seat, confirmed } => {
+                self.result_confirmed = confirmed;
+                if seat == self.my_seat {
+                    self.my_result_confirmed = true;
+                }
+                let n = confirmed.iter().filter(|c| **c).count();
+                self.set_status(format!("确认排名 {n}/4"));
+            }
+            ServerMessage::AllConfirmed { match_over } => {
+                self.my_result_confirmed = true;
+                self.result_confirmed = [true; 4];
+                if match_over {
+                    self.set_status("全部确认 · 比赛结束");
+                } else {
+                    self.set_status("全部确认 · 下一局开始");
+                    self.screen = Screen::Game;
+                }
+            }
             ServerMessage::MatchOver {
                 winner_team,
                 levels,
@@ -369,6 +417,17 @@ impl App {
                 self.winner_team = Some(winner_team);
                 self.team_levels = levels;
                 self.screen = Screen::MatchOver;
+            }
+            ServerMessage::SeatOpened { seat, reason } => {
+                self.set_status(format!("座位{} 空缺 · {reason}", seat + 1));
+            }
+            ServerMessage::SeatTaken { seat, info } => {
+                if let Some(s) = self.seats.iter_mut().find(|s| s.seat == seat) {
+                    *s = info;
+                } else {
+                    self.seats.push(info);
+                }
+                self.set_status(format!("座位{} 有人入座", seat + 1));
             }
             ServerMessage::RoomList { rooms } => {
                 let s = rooms
@@ -397,14 +456,28 @@ impl App {
                 }
                 false
             }
-            Screen::HandResult | Screen::MatchOver => {
-                if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ')) {
-                    if self.screen == Screen::MatchOver {
+            Screen::HandResult => {
+                if matches!(code, KeyCode::Enter | KeyCode::Char(' ')) && !self.my_result_confirmed
+                {
+                    self.net.send(ClientMessage::ConfirmResult);
+                    self.my_result_confirmed = true;
+                    self.set_status("已确认排名 · 等待其他人…");
+                }
+                false
+            }
+            Screen::MatchOver => {
+                if matches!(code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    if !self.my_result_confirmed {
+                        self.net.send(ClientMessage::ConfirmResult);
+                        self.my_result_confirmed = true;
+                        self.set_status("已确认 · 可离开");
+                    } else {
                         self.screen = Screen::Lobby;
                         self.net.send(ClientMessage::LeaveRoom);
-                    } else {
-                        self.screen = Screen::Game;
                     }
+                } else if matches!(code, KeyCode::Esc) {
+                    self.screen = Screen::Lobby;
+                    self.net.send(ClientMessage::LeaveRoom);
                 }
                 false
             }

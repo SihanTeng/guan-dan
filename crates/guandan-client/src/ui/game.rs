@@ -35,13 +35,58 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     draw_input(f, app, root[7]);
 
     if app.screen == crate::app::Screen::HandResult {
-        super::draw_popup(
-            f,
-            area,
-            "本局",
-            &format!("{}\n\nEnter 继续", app.last_hand_result),
-        );
+        draw_result_board(f, app, area, false);
     }
+}
+
+fn rank_cn(r: guandan_core::FinishRank) -> &'static str {
+    match r {
+        guandan_core::FinishRank::Banker => "上游",
+        guandan_core::FinishRank::Follower => "二游",
+        guandan_core::FinishRank::Third => "三游",
+        guandan_core::FinishRank::Dweller => "下游",
+    }
+}
+
+pub fn draw_match_result(f: &mut Frame, app: &App, area: Rect) {
+    draw_result_board(f, app, area, true);
+}
+
+fn draw_result_board(f: &mut Frame, app: &App, area: Rect, match_over: bool) {
+    let mut body = String::new();
+    body.push_str(&format!("{}\n\n", app.last_hand_result));
+    body.push_str("名次\n");
+    for (i, seat) in app.result_finish_order.iter().enumerate() {
+        let r = app
+            .result_ranks
+            .get(i)
+            .copied()
+            .unwrap_or(guandan_core::FinishRank::Dweller);
+        let conf = if app.result_confirmed.get(*seat).copied().unwrap_or(false) {
+            "✓"
+        } else {
+            "…"
+        };
+        let you = if *seat == app.my_seat { " ←你" } else { "" };
+        body.push_str(&format!(
+            "  {}  座位{}  {}{}  [{conf}]\n",
+            rank_cn(r),
+            seat + 1,
+            app.seat_name(*seat),
+            you
+        ));
+    }
+    body.push('\n');
+    let n = app.result_confirmed.iter().filter(|c| **c).count();
+    if app.my_result_confirmed {
+        body.push_str(&format!("已确认  {n}/4  ·  等待其他人…"));
+    } else {
+        body.push_str("Enter 确认本局名次  (四人全部确认后开下一局)");
+    }
+    if match_over {
+        body.push_str("\n比赛结束");
+    }
+    super::draw_popup(f, area, "本局结果 · 确认名次", &body);
 }
 
 fn draw_status_strip(f: &mut Frame, app: &App, area: Rect) {
@@ -284,7 +329,15 @@ impl Widget for HandGrid {
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    let line = if !app.play_buf.is_empty() {
+    let line = if app.no_legal_play && app.current == Some(app.my_seat) {
+        Line::from(Span::styled(
+            "  ⚠ 无牌可出 — 按 P 过  (No legal play)",
+            Style::default()
+                .fg(BG)
+                .bg(theme::INK_RED)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else if !app.play_buf.is_empty() {
         Line::from(vec![
             Span::styled("  › ", Style::default().fg(ACCENT).bg(BG)),
             Span::styled(

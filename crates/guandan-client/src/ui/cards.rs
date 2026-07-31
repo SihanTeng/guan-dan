@@ -1,17 +1,17 @@
-//! Compact card faces — density without visual noise.
+//! Card faces — denser normal cards + decorated jokers (clown / big / little).
 
 use guandan_core::{Card, Rank, Suit};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use super::theme::{self, INK, INK_RED, PAPER, PAPER_SEL, WILD};
 
-/// Compact card: 3 wide × 3 tall (lighter than 5×4 boxes).
-pub const CARD_W: u16 = 4;
-pub const CARD_H: u16 = 3;
+/// Compact normal card.
+pub const CARD_W: u16 = 5;
+pub const CARD_H: u16 = 4;
 
 #[derive(Clone, Copy)]
 pub struct CardFace {
@@ -22,7 +22,11 @@ pub struct CardFace {
 }
 
 impl CardFace {
-    pub fn ink(self) -> ratatui::style::Color {
+    pub fn is_joker(self) -> bool {
+        self.card.rank.is_joker()
+    }
+
+    pub fn ink(self) -> Color {
         if self.card.rank == Rank::RedJoker || matches!(self.card.suit, Suit::Heart | Suit::Diamond)
         {
             INK_RED
@@ -33,8 +37,8 @@ impl CardFace {
 
     pub fn rank_label(self) -> String {
         match self.card.rank {
-            Rank::BlackJoker => "Bj".into(),
-            Rank::RedJoker => "Rj".into(),
+            Rank::BlackJoker => "小王".into(),
+            Rank::RedJoker => "大王".into(),
             Rank::R10 => "10".into(),
             r => r.label().to_string(),
         }
@@ -42,7 +46,7 @@ impl CardFace {
 
     pub fn suit_label(self) -> &'static str {
         match self.card.rank {
-            Rank::BlackJoker | Rank::RedJoker => "★",
+            Rank::BlackJoker | Rank::RedJoker => "🤡",
             _ => self.card.suit.symbol(),
         }
     }
@@ -54,91 +58,179 @@ impl CardFace {
 
 impl Widget for CardFace {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 3 || area.height < 2 {
-            return;
-        }
-
-        let bg = if self.selected { PAPER_SEL } else { PAPER };
-        let border = if self.cursor {
-            theme::BORDER_FOCUS
-        } else if self.selected {
-            theme::ACCENT
-        } else if self.is_wild() {
-            WILD
+        if self.is_joker() {
+            render_joker(self, area, buf);
         } else {
-            theme::BORDER
-        };
-        let ink = self.ink();
-        let x = area.x;
-        let y = area.y;
-        let w = CARD_W.min(area.width);
-        let h = CARD_H.min(area.height);
-
-        // Simple light frame — no double-line chrome
-        let top = match w {
-            4 => "┌──┐",
-            3 => "┌─┐",
-            _ => "┌┐",
-        };
-        let bot = match w {
-            4 => "└──┘",
-            3 => "└─┘",
-            _ => "└┘",
-        };
-
-        for (i, ch) in top.chars().take(w as usize).enumerate() {
-            buf[(x + i as u16, y)]
-                .set_symbol(&ch.to_string())
-                .set_style(Style::default().fg(border).bg(bg));
+            render_normal(self, area, buf);
         }
+    }
+}
 
-        if h >= 2 {
-            let rank = self.rank_label();
-            let body = if w >= 4 {
-                if rank == "10" {
-                    "│10│".to_string()
-                } else if rank.chars().count() == 1 {
-                    let s = self.suit_label();
-                    // rank + suit on one line when possible
-                    format!("│{rank}{s}│")
-                } else {
-                    format!("│{rank:<2}│")
-                }
+fn put(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style) {
+    // Write multi-width carefully: one cell at a time for ASCII frames;
+    // for emoji/CJK, set_symbol on first cell.
+    buf[(x, y)].set_symbol(s).set_style(style);
+}
+
+fn render_normal(face: CardFace, area: Rect, buf: &mut Buffer) {
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let bg = if face.selected { PAPER_SEL } else { PAPER };
+    let border = if face.cursor {
+        theme::BORDER_FOCUS
+    } else if face.selected {
+        theme::ACCENT
+    } else if face.is_wild() {
+        WILD
+    } else {
+        Color::Rgb(120, 120, 130)
+    };
+    let ink = face.ink();
+    let x = area.x;
+    let y = area.y;
+    let w = CARD_W.min(area.width);
+    let h = CARD_H.min(area.height);
+    let st_b = Style::default().fg(border).bg(bg);
+    let st_i = Style::default().fg(ink).bg(bg).add_modifier(Modifier::BOLD);
+
+    // Top
+    let top = if face.selected {
+        "╔═══╗"
+    } else {
+        "┌───┐"
+    };
+    for (i, ch) in top.chars().take(w as usize).enumerate() {
+        buf[(x + i as u16, y)]
+            .set_symbol(&ch.to_string())
+            .set_style(st_b);
+    }
+    // Rank row — corner style
+    if h >= 2 {
+        let rank = face.rank_label();
+        let line = if face.selected {
+            if rank == "10" {
+                "║10 ║".to_string()
             } else {
-                format!("│{rank}│")
-            };
-            for (i, ch) in body.chars().take(w as usize).enumerate() {
-                let edge = i == 0 || i + 1 == w as usize;
-                let style = if edge {
-                    Style::default().fg(border).bg(bg)
-                } else {
-                    Style::default().fg(ink).bg(bg).add_modifier(Modifier::BOLD)
-                };
-                buf[(x + i as u16, y + 1)]
-                    .set_symbol(&ch.to_string())
-                    .set_style(style);
+                format!("║{rank:<2} ║")
             }
+        } else if rank == "10" {
+            "│10 │".to_string()
+        } else {
+            format!("│{rank:<2} │")
+        };
+        for (i, ch) in line.chars().take(w as usize).enumerate() {
+            let edge = i == 0 || i + 1 >= w as usize;
+            buf[(x + i as u16, y + 1)]
+                .set_symbol(&ch.to_string())
+                .set_style(if edge { st_b } else { st_i });
         }
+    }
+    // Suit row
+    if h >= 3 {
+        let suit = face.suit_label();
+        let mid = if face.is_wild() {
+            if face.selected {
+                format!("║ {suit}*║")
+            } else {
+                format!("│ {suit}*│")
+            }
+        } else if face.selected {
+            format!("║ {suit} ║")
+        } else {
+            format!("│ {suit} │")
+        };
+        // suit symbols are single-width in most terminals
+        for (i, ch) in mid.chars().take(w as usize).enumerate() {
+            let edge = i == 0 || i + 1 >= w as usize;
+            buf[(x + i as u16, y + 2)]
+                .set_symbol(&ch.to_string())
+                .set_style(if edge { st_b } else { st_i });
+        }
+    }
+    if h >= 4 {
+        let bot = if face.selected {
+            "╚═══╝"
+        } else {
+            "└───┘"
+        };
+        for (i, ch) in bot.chars().take(w as usize).enumerate() {
+            buf[(x + i as u16, y + 3)]
+                .set_symbol(&ch.to_string())
+                .set_style(st_b);
+        }
+    }
+    let _ = put;
+}
 
-        if h >= 3 {
-            for (i, ch) in bot.chars().take(w as usize).enumerate() {
-                buf[(x + i as u16, y + 2)]
-                    .set_symbol(&ch.to_string())
-                    .set_style(Style::default().fg(border).bg(bg));
-            }
-            // Wild marker in bottom-left inner if room — already on rank line for suits
-            if self.is_wild() && w >= 4 {
-                // soft mark on bottom border center
-                buf[(x + 1, y + 2)]
-                    .set_symbol("*")
-                    .set_style(Style::default().fg(WILD).bg(bg));
-            }
-            if self.cursor && w >= 4 {
-                buf[(x + 2, y + 2)]
-                    .set_symbol("·")
-                    .set_style(Style::default().fg(theme::BORDER_FOCUS).bg(bg));
-            }
+/// Joker: wider art with clown + 小王/大王.
+fn render_joker(face: CardFace, area: Rect, buf: &mut Buffer) {
+    if area.width < 5 || area.height < 4 {
+        render_normal(face, area, buf);
+        return;
+    }
+    let is_big = face.card.rank == Rank::RedJoker;
+    let bg = if face.selected {
+        if is_big {
+            Color::Rgb(255, 235, 235)
+        } else {
+            Color::Rgb(235, 235, 245)
         }
+    } else if is_big {
+        Color::Rgb(255, 245, 245)
+    } else {
+        Color::Rgb(245, 245, 255)
+    };
+    let border = if face.cursor {
+        theme::BORDER_FOCUS
+    } else if face.selected {
+        theme::ACCENT
+    } else if is_big {
+        INK_RED
+    } else {
+        Color::Rgb(70, 70, 100)
+    };
+    let ink = if is_big { INK_RED } else { INK };
+    let x = area.x;
+    let y = area.y;
+    let st_b = Style::default()
+        .fg(border)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    let st_i = Style::default().fg(ink).bg(bg).add_modifier(Modifier::BOLD);
+
+    // 5-col frame
+    for (i, ch) in "┌───┐".chars().enumerate() {
+        buf[(x + i as u16, y)]
+            .set_symbol(&ch.to_string())
+            .set_style(st_b);
+    }
+    // Row1: clown
+    buf[(x, y + 1)].set_symbol("│").set_style(st_b);
+    buf[(x + 1, y + 1)].set_symbol("🤡").set_style(st_i);
+    // clear following cells that emoji may cover
+    buf[(x + 2, y + 1)]
+        .set_symbol(" ")
+        .set_style(Style::default().bg(bg));
+    buf[(x + 3, y + 1)]
+        .set_symbol(" ")
+        .set_style(Style::default().bg(bg));
+    buf[(x + 4, y + 1)].set_symbol("│").set_style(st_b);
+
+    // Row2: 大/小
+    let label = if is_big { "大" } else { "小" };
+    buf[(x, y + 2)].set_symbol("│").set_style(st_b);
+    buf[(x + 1, y + 2)].set_symbol(label).set_style(st_i);
+    buf[(x + 2, y + 2)].set_symbol("王").set_style(st_i);
+    buf[(x + 3, y + 2)]
+        .set_symbol(" ")
+        .set_style(Style::default().bg(bg));
+    buf[(x + 4, y + 2)].set_symbol("│").set_style(st_b);
+
+    for (i, ch) in "└───┘".chars().enumerate() {
+        buf[(x + i as u16, y + 3)]
+            .set_symbol(&ch.to_string())
+            .set_style(st_b);
     }
 }
 
@@ -196,7 +288,6 @@ pub fn render_card_grid(
     }
 }
 
-/// Compact strip for last play — rank+suit pairs, no heavy chrome.
 pub fn card_strip_lines(cards: &[Card], level: Rank) -> Vec<Line<'static>> {
     if cards.is_empty() {
         return vec![Line::from(Span::styled(
@@ -212,7 +303,11 @@ pub fn card_strip_lines(cards: &[Card], level: Rank) -> Vec<Line<'static>> {
             selected: false,
             cursor: false,
         };
-        let label = format!("{}{} ", face.rank_label(), face.suit_label());
+        let label = if face.is_joker() {
+            format!("{}{} ", face.suit_label(), face.rank_label())
+        } else {
+            format!("{}{} ", face.rank_label(), face.suit_label())
+        };
         spans.push(Span::styled(
             label,
             Style::default()

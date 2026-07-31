@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Result};
-use guandan_core::Action;
-use guandan_protocol::{encode_server, ClientMessage, RoomSummary, ServerMessage};
+use guandan_core::{team_of, Action, MatchPhase};
+use guandan_protocol::{encode_server, ClientMessage, RoomSummary, SeatInfo, ServerMessage};
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
@@ -65,11 +65,45 @@ impl AppState {
             let mut rooms = self.rooms.lock().await;
             if let Some(room) = rooms.get_mut(&rid) {
                 if let Some(seat) = room.seat_of(session_id) {
-                    room.slots[seat].session_id = None;
-                    room.slots[seat].ready = false;
-                    room.slots[seat].name = format!("空位{}", seat + 1);
+                    let vacate = room.vacate_seat(seat, "玩家离开");
                     let msg = encode_server(&ServerMessage::PlayerLeft { seat }).unwrap();
                     self.broadcast_room_locked(room, None, msg).await;
+                    // Mid-game: fill with bot immediately so the hand can finish;
+                    // between hands leave vacant for re-party until timeout.
+                    let mid_play = room
+                        .game
+                        .as_ref()
+                        .map(|g| matches!(g.phase, MatchPhase::Playing | MatchPhase::Tribute))
+                        .unwrap_or(false);
+                    if mid_play {
+                        room.slots[seat].is_bot = true;
+                        room.slots[seat].name = format!("机器人{}", seat + 1);
+                        room.slots[seat].ready = true;
+                        let taken = ServerMessage::SeatTaken {
+                            seat,
+                            info: SeatInfo {
+                                seat,
+                                name: room.slots[seat].name.clone(),
+                                is_bot: true,
+                                ready: true,
+                                team: team_of(seat),
+                            },
+                        };
+                        if let Ok(t) = encode_server(&taken) {
+                            self.broadcast_room_locked(room, None, t).await;
+                        }
+                    } else {
+                        for (target, m) in vacate {
+                            if let Ok(t) = encode_server(&m) {
+                                match target {
+                                    Some(sid) => {
+                                        let _ = self.send_to(sid, t).await;
+                                    }
+                                    None => self.broadcast_room_locked(room, None, t).await,
+                                }
+                            }
+                        }
+                    }
                 }
                 if room.player_count() == 0 {
                     rooms.remove(&rid);
@@ -272,6 +306,12 @@ impl AppState {
                 self.game_action(session_id, Action::ReturnTribute { card_id, to_seat })
                     .await?;
             }
+            ClientMessage::ConfirmResult => {
+                self.game_action(session_id, Action::ConfirmResult).await?;
+            }
+            ClientMessage::TakeSeat { seat } => {
+                self.take_seat(session_id, seat).await?;
+            }
             ClientMessage::Chat { content } => {
                 let (room_id, name) = {
                     let sessions = self.sessions.lock().await;
@@ -446,7 +486,57 @@ impl AppState {
         Ok(())
     }
 
-    /// Periodic: turn timeouts, bot steps (respecting play reveal), hand continue.
+    async fn take_seat(&self, session_id: Uuid, seat: usize) -> Result<()> {
+        let name = self.name_of(session_id).await;
+        // Leave previous room seat if any
+        if let Some(old) = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .and_then(|s| s.room_id.clone())
+        {
+            let _ = old;
+        }
+        // Find room from session
+        let room_id = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .and_then(|s| s.room_id.clone());
+        // If not in room, allow join via TakeSeat only when already in that room empty —
+        // Prefer: player in lobby takes seat by joining room first.
+        // Also support: session without room cannot TakeSeat — must JoinRoom then.
+        let Some(room_id) = room_id else {
+            bail!("请先加入房间再占座");
+        };
+        let mut rooms = self.rooms.lock().await;
+        let room = rooms
+            .get_mut(&room_id)
+            .ok_or_else(|| anyhow::anyhow!("房间不存在"))?;
+        // If already seated, vacate old
+        if let Some(old_seat) = room.seat_of(session_id) {
+            if old_seat == seat {
+                return Ok(());
+            }
+            room.slots[old_seat].session_id = None;
+        }
+        let msgs = room
+            .take_seat(session_id, name, seat)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.get_mut(&session_id) {
+                s.room_id = Some(room_id.clone());
+            }
+        }
+        drop(rooms);
+        self.dispatch_stored(&room_id, msgs).await;
+        Ok(())
+    }
+
+    /// Periodic: turn timeouts, bot steps, result confirms, re-party.
     pub async fn tick_game(&self) {
         let room_ids: Vec<String> = self.rooms.lock().await.keys().cloned().collect();
         for rid in room_ids {
@@ -459,12 +549,13 @@ impl AppState {
             }
             let timeout_msgs = room.check_turn_timeout();
             let bot_msgs = room.bot_actions();
-            let cont = room.maybe_continue();
+            let confirm_msgs = room.check_confirm_timeout();
+            let reparty_msgs = room.check_reparty();
             drop(rooms);
-            if !timeout_msgs.is_empty() || !bot_msgs.is_empty() || !cont.is_empty() {
-                self.dispatch_stored(&rid, timeout_msgs).await;
-                self.dispatch_stored(&rid, bot_msgs).await;
-                self.dispatch_stored(&rid, cont).await;
+            for batch in [timeout_msgs, bot_msgs, confirm_msgs, reparty_msgs] {
+                if !batch.is_empty() {
+                    self.dispatch_stored(&rid, batch).await;
+                }
             }
         }
     }

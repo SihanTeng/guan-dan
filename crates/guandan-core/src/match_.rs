@@ -106,6 +106,8 @@ pub struct Match {
     pub winner_team: Option<TeamId>,
     /// Lead seat for this hand.
     pub lead_seat: Seat,
+    /// After HandOver / MatchOver: who confirmed the result (all 4 required before next deal).
+    pub confirmed: [bool; 4],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +124,8 @@ pub enum Action {
         card_ids: Vec<u8>,
     },
     Pass,
+    /// Acknowledge hand/match result (rank board). All 4 must confirm before Deal.
+    ConfirmResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +174,15 @@ pub enum Event {
         match_over: bool,
         winner_team: Option<TeamId>,
     },
+    /// Seat acknowledged the result board (上游…下游).
+    ResultConfirmed {
+        seat: Seat,
+        confirmed: [bool; 4],
+    },
+    /// All four confirmed — server may deal next hand.
+    AllConfirmed {
+        match_over: bool,
+    },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -192,6 +205,10 @@ pub enum MatchError {
     BadTributeReturn,
     #[error("游戏已结束")]
     MatchOver,
+    #[error("已确认过")]
+    AlreadyConfirmed,
+    #[error("需要先确认本局结果")]
+    NeedConfirm,
 }
 
 impl Match {
@@ -215,6 +232,7 @@ impl Match {
             prev_banker: None,
             winner_team: None,
             lead_seat: 0,
+            confirmed: [false; 4],
         }
     }
 
@@ -228,8 +246,11 @@ impl Match {
         action: Action,
         rng: &mut R,
     ) -> Result<Vec<Event>, MatchError> {
-        if self.phase == MatchPhase::MatchOver {
-            return Err(MatchError::MatchOver);
+        match action {
+            Action::ConfirmResult => return self.confirm_result(seat),
+            Action::Deal => {}
+            _ if self.phase == MatchPhase::MatchOver => return Err(MatchError::MatchOver),
+            _ => {}
         }
         match action {
             Action::Deal => self.deal(rng),
@@ -238,13 +259,46 @@ impl Match {
             }
             Action::Play { card_ids } => self.play(seat, &card_ids),
             Action::Pass => self.pass(seat),
+            Action::ConfirmResult => unreachable!(),
         }
     }
 
-    fn deal<R: Rng + ?Sized>(&mut self, rng: &mut R) -> Result<Vec<Event>, MatchError> {
-        if self.phase != MatchPhase::Idle && self.phase != MatchPhase::HandOver {
+    /// Acknowledge hand result ranks. When all four seats confirm, emits AllConfirmed.
+    pub fn confirm_result(&mut self, seat: Seat) -> Result<Vec<Event>, MatchError> {
+        if self.phase != MatchPhase::HandOver && self.phase != MatchPhase::MatchOver {
             return Err(MatchError::BadPhase);
         }
+        if seat >= 4 {
+            return Err(MatchError::NotYourTurn);
+        }
+        if self.confirmed[seat] {
+            return Err(MatchError::AlreadyConfirmed);
+        }
+        self.confirmed[seat] = true;
+        let mut events = vec![Event::ResultConfirmed {
+            seat,
+            confirmed: self.confirmed,
+        }];
+        if self.confirmed.iter().all(|&c| c) {
+            let match_over = self.phase == MatchPhase::MatchOver;
+            events.push(Event::AllConfirmed { match_over });
+            if !match_over {
+                // Ready for next deal
+                self.phase = MatchPhase::Idle;
+            }
+        }
+        Ok(events)
+    }
+
+    fn deal<R: Rng + ?Sized>(&mut self, rng: &mut R) -> Result<Vec<Event>, MatchError> {
+        // Only after Idle (includes post-AllConfirmed). Never skip confirm board.
+        if self.phase == MatchPhase::HandOver {
+            return Err(MatchError::NeedConfirm);
+        }
+        if self.phase != MatchPhase::Idle {
+            return Err(MatchError::BadPhase);
+        }
+        self.confirmed = [false; 4];
         self.hand_number += 1;
         // Hand level = level of team that has Banker from previous hand
         if let Some(banker) = self.prev_banker {
@@ -612,12 +666,10 @@ impl Match {
             winner_team = Some(winning_team);
             self.winner_team = winner_team;
             self.phase = MatchPhase::MatchOver;
-        } else if self.team_levels[ti] == Rank::RA && old == Rank::RA {
-            // stayed at ace but blocked — continue
-            self.phase = MatchPhase::HandOver;
         } else {
             self.phase = MatchPhase::HandOver;
         }
+        self.confirmed = [false; 4];
 
         // If we advanced TO ace and won this hand from below ace, need another hand to claim
         // (only win when already at ace before the hand). Correct per Wikipedia.

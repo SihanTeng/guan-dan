@@ -8,6 +8,10 @@ use uuid::Uuid;
 pub const TURN_TIMEOUT_SECS: u32 = 30;
 /// Fixed hold time after a play so others can see it (seconds). Not configurable.
 pub const PLAY_REVEAL_SECS: u32 = 3;
+/// Seconds for all seats to confirm hand ranks before next deal.
+pub const CONFIRM_TIMEOUT_SECS: u32 = 30;
+/// Seconds to re-party empty seats (bots fill / new humans can join).
+pub const REPARTY_TIMEOUT_SECS: u32 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -22,19 +26,38 @@ pub struct Envelope {
 #[serde(tag = "ty", rename_all = "snake_case")]
 pub enum ClientMessage {
     Ping,
-    Reconnect { session_id: Uuid },
-    CreateRoom { name: String },
-    JoinRoom { room_id: String },
+    Reconnect {
+        session_id: Uuid,
+    },
+    CreateRoom {
+        name: String,
+    },
+    JoinRoom {
+        room_id: String,
+    },
     LeaveRoom,
     QuickMatch,
     PracticeMatch,
     Ready,
     CancelReady,
     ListRooms,
-    PlayCards { card_ids: Vec<u8> },
+    PlayCards {
+        card_ids: Vec<u8>,
+    },
     Pass,
-    ReturnTribute { card_id: u8, to_seat: Seat },
-    Chat { content: String },
+    ReturnTribute {
+        card_id: u8,
+        to_seat: Seat,
+    },
+    /// Confirm hand/match result ranks (all 4 required before next round).
+    ConfirmResult,
+    /// Take a vacant seat as substitute (between hands or after timeout re-party).
+    TakeSeat {
+        seat: Seat,
+    },
+    Chat {
+        content: String,
+    },
 }
 
 // ── Server → Client ──────────────────────────────────────────────
@@ -115,6 +138,9 @@ pub enum ServerMessage {
         /// Always [`TURN_TIMEOUT_SECS`] (30); kept for older clients / UI.
         #[serde(default = "default_turn_timeout_secs")]
         timeout_secs: u32,
+        /// Whether this seat has any legal follow (false → must pass / notify 无牌可出).
+        #[serde(default = "default_true")]
+        can_follow: bool,
     },
     CardPlayed {
         seat: Seat,
@@ -140,15 +166,43 @@ pub enum ServerMessage {
     },
     HandResult {
         finish_order: Vec<Seat>,
+        /// Parallel to finish_order — 上游/二游/三游/下游 for each seat.
+        ranks: Vec<FinishRank>,
         winning_team: TeamId,
         level_gain: u8,
         new_levels: [Rank; 2],
         match_over: bool,
         winner_team: Option<TeamId>,
+        #[serde(default = "default_confirm_timeout")]
+        confirm_timeout_secs: u32,
+        /// Who already confirmed (index = seat).
+        #[serde(default)]
+        confirmed: [bool; 4],
+    },
+    ResultConfirmed {
+        seat: Seat,
+        confirmed: [bool; 4],
+    },
+    /// All four confirmed ranks — next deal / match leave may proceed.
+    AllConfirmed {
+        match_over: bool,
     },
     MatchOver {
         winner_team: TeamId,
         levels: [Rank; 2],
+    },
+    /// Seat opened for re-party / substitute (bot or disconnected).
+    SeatOpened {
+        seat: Seat,
+        reason: String,
+    },
+    SeatTaken {
+        seat: Seat,
+        info: SeatInfo,
+    },
+    /// Notify current player they have no legal play.
+    NoLegalPlay {
+        seat: Seat,
     },
     Chat {
         seat: Option<Seat>,
@@ -188,6 +242,14 @@ fn default_turn_timeout_secs() -> u32 {
 
 fn default_play_reveal_secs() -> u32 {
     PLAY_REVEAL_SECS
+}
+
+fn default_confirm_timeout() -> u32 {
+    CONFIRM_TIMEOUT_SECS
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn encode_client(msg: &ClientMessage) -> Result<String, serde_json::Error> {

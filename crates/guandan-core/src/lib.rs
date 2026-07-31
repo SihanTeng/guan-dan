@@ -16,5 +16,6 @@ pub use match_::{
     TeamId,
 };
 pub use rule::{
-    can_beat, find_smallest_beater, find_smallest_lead, parse_hand, HandType, ParsedHand, RuleError,
+    can_beat, can_follow, find_smallest_beater, find_smallest_lead, parse_hand, HandType,
+    ParsedHand, RuleError,
 };

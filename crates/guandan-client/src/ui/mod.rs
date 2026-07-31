@@ -60,14 +60,19 @@ fn draw_help(f: &mut Frame, area: Rect) {
   ←→ Space 点选
 
 计时（固定）
-  每回合 30 秒（超时自动过 / 首出最小牌）
-  他人出牌展示 3 秒
+  每回合 30 秒 · 他人出牌展示 3 秒
+  本局结束：四人确认名次后才开下一局（超时自动确认）
 
 H / Esc  关闭";
     draw_popup(f, area, "帮助", text);
 }
 
 fn draw_match_over(f: &mut Frame, app: &App, area: Rect) {
+    // Reuse result board if we have finish order; else compact win screen.
+    if !app.result_finish_order.is_empty() {
+        crate::ui::game::draw_match_result(f, app, area);
+        return;
+    }
     let team = match app.winner_team {
         Some(guandan_core::TeamId::A) => "队 A",
         Some(guandan_core::TeamId::B) => "队 B",
@@ -78,7 +83,7 @@ fn draw_match_over(f: &mut Frame, app: &App, area: Rect) {
         area,
         "结束",
         &format!(
-            "胜者  {team}\nA {}  ·  B {}\n\nEnter 返回",
+            "胜者  {team}\nA {}  ·  B {}\n\nEnter 确认 / 离开",
             app.team_levels[0].label(),
             app.team_levels[1].label()
         ),

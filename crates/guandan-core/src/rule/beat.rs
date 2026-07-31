@@ -4,6 +4,14 @@ use super::parse::{key_beats, parse_hand, HandType, ParsedHand};
 use super::BombTier;
 use crate::card::{play_strength, Card, Rank};
 
+/// Whether the player has any legal follow/bomb against `last` (or can always lead).
+pub fn can_follow(hand: &[Card], last: Option<&ParsedHand>, level: Rank) -> bool {
+    match last {
+        None => !hand.is_empty(),
+        Some(lp) => find_smallest_beater(hand, lp, level).is_some(),
+    }
+}
+
 /// Whether `new_hand` beats `last_hand` under the current level.
 pub fn can_beat(new_hand: &ParsedHand, last_hand: &ParsedHand, level: Rank) -> bool {
     // Joker bomb beats everything

@@ -3,7 +3,7 @@
 mod beat;
 mod parse;
 
-pub use beat::{can_beat, find_smallest_beater, find_smallest_lead};
+pub use beat::{can_beat, can_follow, find_smallest_beater, find_smallest_lead};
 pub use parse::{parse_hand, HandType, ParsedHand, RuleError};
 
 use crate::card::{Card, Rank};

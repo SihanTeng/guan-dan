@@ -1,0 +1,12 @@
+[package]
+name = "guandan-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebSocket JSON protocol for Guandan multiplayer"
+
+[dependencies]
+guandan-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

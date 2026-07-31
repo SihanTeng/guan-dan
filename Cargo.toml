@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/guandan-core",
+    "crates/guandan-protocol",
+    "crates/guandan-bot",
+    "crates/guandan-server",
+    "crates/guandan-client",
+]
+default-members = [
+    "crates/guandan-core",
+    "crates/guandan-protocol",
+    "crates/guandan-bot",
+    "crates/guandan-server",
+    "crates/guandan-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["guandan"]
+
+[workspace.dependencies]
+guandan-core = { path = "crates/guandan-core" }
+guandan-protocol = { path = "crates/guandan-protocol" }
+guandan-bot = { path = "crates/guandan-bot" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+ratatui = "0.29"
+crossterm = "0.28"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

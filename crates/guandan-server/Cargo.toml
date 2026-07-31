@@ -1,0 +1,26 @@
+[package]
+name = "guandan-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Guandan WebSocket game server"
+
+[[bin]]
+name = "guandan-server"
+path = "src/main.rs"
+
+[dependencies]
+guandan-core = { workspace = true }
+guandan-protocol = { workspace = true }
+guandan-bot = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }

@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }} ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_os: linux
+            artifact_arch: amd64
+            bin_ext: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_os: linux
+            artifact_arch: arm64
+            bin_ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_os: darwin
+            artifact_arch: amd64
+            bin_ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_os: darwin
+            artifact_arch: arm64
+            bin_ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_os: windows
+            artifact_arch: amd64
+            bin_ext: ".exe"
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_os: windows
+            artifact_arch: arm64
+            bin_ext: ".exe"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install Linux aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p guandan-client -p guandan-server
+
+          OUT="target/${{ matrix.target }}/release"
+          CLIENT="guandan-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}${{ matrix.bin_ext }}"
+          SERVER="guandan-server-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}${{ matrix.bin_ext }}"
+
+          cp "$OUT/guandan${{ matrix.bin_ext }}" "$CLIENT"
+          cp "$OUT/guandan-server${{ matrix.bin_ext }}" "$SERVER"
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$CLIENT" > "$CLIENT.sha256"
+            sha256sum "$SERVER" > "$SERVER.sha256"
+          else
+            shasum -a 256 "$CLIENT" > "$CLIENT.sha256"
+            shasum -a 256 "$SERVER" > "$SERVER.sha256"
+          fi
+
+          echo "CLIENT=$CLIENT" >> "$GITHUB_ENV"
+          echo "SERVER=$SERVER" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}
+          path: |
+            guandan-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}*
+            guandan-server-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}*
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: bin-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          body: |
+            ## 掼蛋 Guandan ${{ github.ref_name }}
+
+            ### Install client
+
+            **macOS / Linux**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/SihanTeng/guan-dan/main/install.sh | bash
+            ```
+
+            **Windows (PowerShell)**
+            ```powershell
+            irm https://raw.githubusercontent.com/SihanTeng/guan-dan/main/install.ps1 | iex
+            ```
+
+            Then run `guandan` (client) or `guandan-server` (server).

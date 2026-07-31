@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+*.iml
+coverage/
+*.profraw
+*.profdata
+
+# Local reference clone (not part of published tree)
+/ref/

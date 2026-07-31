@@ -230,7 +230,7 @@ fn draw_hand(f: &mut Frame, app: &App, area: Rect) {
     let n = app.hand.len();
     let sel: usize = app.selected.iter().filter(|s| **s).count();
     let title = if app.tribute_mode {
-        format!(" 回贡 · 选 1 张 ≤10 的牌  ({n}) ")
+        format!(" 回贡 · 选 1 张 ≤10  ·  手牌 {n} ")
     } else {
         format!(" 我的手牌  {n} 张 · 已选 {sel} ")
     };
@@ -242,14 +242,31 @@ fn draw_hand(f: &mut Frame, app: &App, area: Rect) {
         theme::panel_border()
     };
 
+    // Input strip: typed ranks (ddz-style) or visual-select hint
+    let input_line = if !app.play_buf.is_empty() {
+        format!(
+            " 输入: {}▌  Enter 出牌  Backspace 删  Esc 清空 ",
+            app.play_buf
+        )
+    } else {
+        " ←→ 光标  Space 点选  键入点数如 34567/KK  Enter 出  P 不出  Esc 清空 ".into()
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border)
         .style(theme::panel())
         .title(Span::styled(title, theme::panel_title()))
         .title_bottom(Span::styled(
-            " ←→ 移动  Space 选  点数键  Enter 出  P 不出 ",
-            Style::default().fg(MUTED).bg(FELT_DARK),
+            input_line,
+            if app.play_buf.is_empty() {
+                Style::default().fg(MUTED).bg(FELT_DARK)
+            } else {
+                Style::default()
+                    .fg(FELT_DARK)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            },
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -322,7 +339,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             app.counts[0], app.counts[1], app.counts[2], app.counts[3]
         )
     } else {
-        " C 记牌器  ·  H 帮助  ·  点数 3-9 T J Q K A 2 B R  ·  红心级牌 = 逢人配 ★ ".into()
+        " C 记牌  ·  H 帮助  ·  出牌: 键入 3-9 T/0/10 J Q K A 2 B R 后 Enter  ·  逢人配 * ".into()
     };
     f.render_widget(
         Paragraph::new(Span::styled(text, theme::muted_on_felt())).alignment(Alignment::Center),

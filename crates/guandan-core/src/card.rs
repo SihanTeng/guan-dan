@@ -348,6 +348,75 @@ pub fn deal_four<R: Rng + ?Sized>(rng: &mut R) -> [Vec<Card>; 4] {
     hands
 }
 
+/// Parse a ddz-style rank input string into rank counts.
+///
+/// Accepts chars: `3`-`9`, `T`/`0`/`10`→10, `J Q K A 2`, `B` black joker, `R` red joker.
+/// Spaces and separators are ignored. Example: `"34567"`, `"KK"`, `"3334"`, `"BR"`.
+pub fn parse_rank_input(input: &str) -> Result<std::collections::HashMap<Rank, usize>, String> {
+    let clean = input
+        .to_ascii_uppercase()
+        .replace([' ', ','], "")
+        .replace("10", "T");
+    if clean.is_empty() {
+        return Err("空输入".into());
+    }
+    let mut counts = std::collections::HashMap::new();
+    for ch in clean.chars() {
+        let rank = Rank::from_key_char(ch).ok_or_else(|| format!("无法识别: {ch}"))?;
+        *counts.entry(rank).or_default() += 1;
+    }
+    Ok(counts)
+}
+
+/// Find cards in `hand` matching a typed rank string (like ddz `34567` / `KK`).
+/// Returns cards (by value) picked from the hand, or an error if not enough.
+pub fn find_cards_in_hand(hand: &[Card], input: &str) -> Result<Vec<Card>, String> {
+    let need = parse_rank_input(input)?;
+    let mut have: std::collections::HashMap<Rank, usize> = std::collections::HashMap::new();
+    for c in hand {
+        *have.entry(c.rank).or_default() += 1;
+    }
+    for (r, n) in &need {
+        let h = have.get(r).copied().unwrap_or(0);
+        if h < *n {
+            return Err(format!("你的 {} 不够（要{n}张，有{h}张）", r.label()));
+        }
+    }
+    let mut remaining = hand.to_vec();
+    let mut result = Vec::new();
+    for (rank, count) in need {
+        let mut found = 0;
+        let mut i = remaining.len();
+        while i > 0 && found < count {
+            i -= 1;
+            if remaining[i].rank == rank {
+                result.push(remaining.remove(i));
+                found += 1;
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Indices into `hand` for cards that would be picked by `find_cards_in_hand`.
+pub fn find_card_indices_in_hand(hand: &[Card], input: &str) -> Result<Vec<usize>, String> {
+    let cards = find_cards_in_hand(hand, input)?;
+    let mut used = vec![false; hand.len()];
+    let mut indices = Vec::with_capacity(cards.len());
+    for want in &cards {
+        if let Some(i) = hand
+            .iter()
+            .enumerate()
+            .position(|(i, c)| !used[i] && c.id == want.id)
+        {
+            used[i] = true;
+            indices.push(i);
+        }
+    }
+    indices.sort_unstable();
+    Ok(indices)
+}
+
 /// Parse compact card codes like `H7`, `ST`, `BJ` (without id — for tests/protocol helpers).
 /// Returns a card with id=0; prefer matching by suit+rank against a real hand in production.
 pub fn parse_card_code(code: &str) -> Option<Card> {
@@ -460,5 +529,25 @@ mod tests {
         let mut ids: Vec<_> = hands.iter().flatten().map(|c| c.id).collect();
         ids.sort();
         assert_eq!(ids, (0..108).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn find_cards_typed_input() {
+        let hand = cards_from_codes(&["S3", "H3", "C4", "D5", "S6", "H7", "ST", "HJ"]);
+        let got = find_cards_in_hand(&hand, "34567").unwrap();
+        assert_eq!(got.len(), 5);
+        let ranks: Vec<_> = got.iter().map(|c| c.rank).collect();
+        assert!(ranks.contains(&Rank::R3));
+        assert!(ranks.contains(&Rank::R7));
+
+        let pair = find_cards_in_hand(&hand, "33").unwrap();
+        assert_eq!(pair.len(), 2);
+
+        assert!(find_cards_in_hand(&hand, "333").is_err());
+        // 10 via T or 10
+        let t = find_cards_in_hand(&hand, "T").unwrap();
+        assert_eq!(t[0].rank, Rank::R10);
+        let t2 = find_cards_in_hand(&hand, "10").unwrap();
+        assert_eq!(t2[0].rank, Rank::R10);
     }
 }

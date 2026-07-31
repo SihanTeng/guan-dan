@@ -1,7 +1,9 @@
 //! Client application state.
 
 use crossterm::event::KeyCode;
-use guandan_core::{Card, FinishRank, HandType, Rank, Seat, TeamId};
+use guandan_core::{
+    find_card_indices_in_hand, find_cards_in_hand, Card, FinishRank, HandType, Rank, Seat, TeamId,
+};
 use guandan_protocol::{ClientMessage, PublicPlay, SeatInfo, ServerMessage};
 use uuid::Uuid;
 
@@ -46,6 +48,8 @@ pub struct App {
     pub lobby_focus: LobbyFocus,
     pub tribute_mode: bool,
     pub tribute_payers: Vec<Seat>,
+    /// Typed rank sequence for play, e.g. `"34567"` / `"KK"` / `"3334"` (ddz-style).
+    pub play_buf: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +92,7 @@ impl App {
             lobby_focus: LobbyFocus::Practice,
             tribute_mode: false,
             tribute_payers: Vec::new(),
+            play_buf: String::new(),
         }
     }
 
@@ -175,6 +180,7 @@ impl App {
                 self.counts = counts;
                 self.selected = vec![false; self.hand.len()];
                 self.cursor = 0;
+                self.play_buf.clear();
                 self.current = Some(lead);
                 self.must_lead = true;
                 self.last_play = None;
@@ -427,7 +433,11 @@ impl App {
     fn on_game_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Esc => {
-                // stay in game
+                // Clear typed buffer + selection (stay in game)
+                if !self.play_buf.is_empty() || self.selected.iter().any(|s| *s) {
+                    self.clear_play_input();
+                    self.set_status("已清空输入 · Cleared");
+                }
             }
             KeyCode::Char('h') | KeyCode::Char('H') => {
                 self.prev_screen = Screen::Game;
@@ -436,68 +446,112 @@ impl App {
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 self.show_counter = !self.show_counter;
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Char('[') => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
                 }
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Char(']') => {
                 if self.cursor + 1 < self.hand.len() {
                     self.cursor += 1;
                 }
             }
             KeyCode::Char(' ') => {
+                // Visual toggle: leave typed buffer mode
+                self.play_buf.clear();
                 if let Some(sel) = self.selected.get_mut(self.cursor) {
                     *sel = !*sel;
                 }
             }
+            KeyCode::Backspace | KeyCode::Delete => {
+                if !self.play_buf.is_empty() {
+                    self.play_buf.pop();
+                    let _ = self.sync_selection_from_buf();
+                } else if let Some(sel) = self.selected.get_mut(self.cursor) {
+                    // no typed input → deselect cursor card
+                    *sel = false;
+                }
+            }
             KeyCode::Char('p') | KeyCode::Char('P') => {
+                // If buffer is "P" only, still pass; if buffer has cards, 'P' would be weird.
+                // Pass always wins when not leading.
                 if self.current == Some(self.my_seat) && !self.must_lead && !self.tribute_mode {
                     self.net.send(ClientMessage::Pass);
-                    self.clear_selection();
+                    self.clear_play_input();
+                    self.set_status("不出 · Pass");
                 }
             }
             KeyCode::Enter => {
                 self.submit_play();
             }
             KeyCode::Char(ch) => {
-                self.rank_key(ch);
+                // ddz-style: append rank chars to play buffer
+                self.type_rank_char(ch);
             }
             _ => {}
         }
         false
     }
 
-    fn rank_key(&mut self, ch: char) {
-        let rank = match Rank::from_key_char(ch) {
-            Some(r) => r,
-            None => return,
-        };
-        // Toggle all cards of this rank; if none selected of rank, select one more unselected
-        let indices: Vec<usize> = self
-            .hand
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.rank == rank)
-            .map(|(i, _)| i)
-            .collect();
-        if indices.is_empty() {
+    /// Append a rank key into the typed play buffer and highlight matching cards.
+    fn type_rank_char(&mut self, ch: char) {
+        let upper = ch.to_ascii_uppercase();
+        // Allow rank keys + '0' for 10
+        if Rank::from_key_char(upper).is_none() && upper != '0' {
             return;
         }
-        let any_selected = indices.iter().any(|&i| self.selected[i]);
-        if any_selected {
-            for i in indices {
-                self.selected[i] = false;
+        // Cap buffer length (hand is 27)
+        if self.play_buf.len() >= 32 {
+            return;
+        }
+        self.play_buf.push(upper);
+        match self.sync_selection_from_buf() {
+            Ok(()) => {
+                let n = self.selected.iter().filter(|s| **s).count();
+                self.set_status(format!(
+                    "输入 {}  · 已匹配 {n} 张  Enter 出牌",
+                    self.play_buf
+                ));
             }
-        } else {
-            for i in indices {
-                self.selected[i] = true;
+            Err(e) => {
+                // Keep buffer so user can backspace; soft-fail status
+                self.set_status(format!("{}  [{}]", e, self.play_buf));
+                // Still try partial highlight of longest valid prefix? Keep last good selection.
             }
-            self.cursor = self
-                .hand
-                .iter()
-                .position(|c| c.rank == rank)
-                .unwrap_or(self.cursor);
+        }
+    }
+
+    /// Recompute `selected` from `play_buf`. Empty buffer clears selection.
+    fn sync_selection_from_buf(&mut self) -> Result<(), String> {
+        if self.selected.len() != self.hand.len() {
+            self.selected = vec![false; self.hand.len()];
+        }
+        if self.play_buf.is_empty() {
+            for s in &mut self.selected {
+                *s = false;
+            }
+            return Ok(());
+        }
+        match find_card_indices_in_hand(&self.hand, &self.play_buf) {
+            Ok(indices) => {
+                for s in &mut self.selected {
+                    *s = false;
+                }
+                for i in indices {
+                    if let Some(s) = self.selected.get_mut(i) {
+                        *s = true;
+                    }
+                    self.cursor = i;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Don't wipe previous selection on incomplete "10" mid-type
+                if self.play_buf.ends_with('1') {
+                    return Ok(());
+                }
+                Err(e)
+            }
         }
     }
 
@@ -507,20 +561,49 @@ impl App {
         }
     }
 
+    fn clear_play_input(&mut self) {
+        self.play_buf.clear();
+        self.clear_selection();
+    }
+
     fn submit_play(&mut self) {
         if self.current != Some(self.my_seat) {
             self.set_status("还没轮到你 · Not your turn");
             return;
         }
-        let ids: Vec<u8> = self
-            .hand
-            .iter()
-            .zip(self.selected.iter())
-            .filter(|(_, sel)| **sel)
-            .map(|(c, _)| c.id)
-            .collect();
+
+        // Prefer typed buffer (ddz-style), else visual selection
+        let ids: Vec<u8> = if !self.play_buf.is_empty() {
+            // Allow PASS typed in buffer
+            let upper = self.play_buf.to_ascii_uppercase();
+            if upper == "P" || upper == "PASS" {
+                if !self.must_lead && !self.tribute_mode {
+                    self.net.send(ClientMessage::Pass);
+                    self.clear_play_input();
+                    self.set_status("不出 · Pass");
+                } else {
+                    self.set_status("必须出牌 · Must play");
+                }
+                return;
+            }
+            match find_cards_in_hand(&self.hand, &self.play_buf) {
+                Ok(cards) => cards.iter().map(|c| c.id).collect(),
+                Err(e) => {
+                    self.set_status(e);
+                    return;
+                }
+            }
+        } else {
+            self.hand
+                .iter()
+                .zip(self.selected.iter())
+                .filter(|(_, sel)| **sel)
+                .map(|(c, _)| c.id)
+                .collect()
+        };
+
         if ids.is_empty() {
-            self.set_status("请先选牌 · Select cards");
+            self.set_status("请选牌或输入点数 · Type ranks e.g. 34567 / KK");
             return;
         }
         if self.tribute_mode {
@@ -529,11 +612,11 @@ impl App {
                 card_id: ids[0],
                 to_seat: to,
             });
-            self.clear_selection();
+            self.clear_play_input();
             return;
         }
         self.net.send(ClientMessage::PlayCards { card_ids: ids });
-        self.clear_selection();
+        self.clear_play_input();
     }
 
     pub fn relative_seat(&self, offset: usize) -> Seat {

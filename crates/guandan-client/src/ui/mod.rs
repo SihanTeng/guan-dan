@@ -57,9 +57,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
 • 升级：头+二 +3 · 头+三 +2 · 头+下 +1；A 级再胜一局获胜\n\
 • 进贡：下游最大牌（非逢人配）→ 上游回 ≤10\n\
 \n\
-【按键】\n\
-←→ 光标   Space 选牌   点数键 同点多选\n\
-Enter 出牌   P 不出   C 记牌器   H 帮助   Esc 返回\n\
+【按键 · 出牌】\n\
+键入点数序列（34567 / KK / 3334 / BR）后 Enter 出牌\n\
+←→ 光标  Space 点选  Backspace 删  Esc 清空\n\
+P 不出  C 记牌器  H 帮助\n\
 \n\
 按 H / Esc 关闭";
     draw_popup(f, area, " 📖 帮助 ", text);

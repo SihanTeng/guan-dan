@@ -7,7 +7,10 @@ pub mod card;
 pub mod match_;
 pub mod rule;
 
-pub use card::{Card, CardId, Color, Rank, Suit};
+pub use card::{
+    find_card_indices_in_hand, find_cards_in_hand, parse_rank_input, Card, CardId, Color, Rank,
+    Suit,
+};
 pub use match_::{
     partner, team_of, Action, Event, FinishRank, Match, MatchError, MatchPhase, PlayerState, Seat,
     TeamId,

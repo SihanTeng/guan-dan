@@ -1,4 +1,4 @@
-.PHONY: help build test lint fmt check hooks run-server run-client clean release-dry
+.PHONY: help build test lint fmt check hooks run-server run-client dev clean release-dry
 
 .DEFAULT_GOAL := help
 
@@ -39,6 +39,14 @@ run-server: ## Start server on :9100
 
 run-client: ## Start TUI client
 	cargo run -p guandan-client -- --server ws://127.0.0.1:9100
+
+dev: ## Build + start server & TUI client (scripts/dev.sh)
+	@chmod +x scripts/dev.sh
+	./scripts/dev.sh
+
+dev-release: ## Same as dev, release binaries
+	@chmod +x scripts/dev.sh
+	./scripts/dev.sh --release
 
 clean: ## Remove target/
 	cargo clean

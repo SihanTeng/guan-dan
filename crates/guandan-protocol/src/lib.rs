@@ -9,7 +9,9 @@ pub const TURN_TIMEOUT_SECS: u32 = 30;
 /// Fixed hold time after a play so others can see it (seconds). Not configurable.
 pub const PLAY_REVEAL_SECS: u32 = 3;
 /// Seconds for all seats to confirm hand ranks before next deal.
-pub const CONFIRM_TIMEOUT_SECS: u32 = 30;
+/// Unconfirmed seats (humans) are auto-confirmed when this elapses; bots
+/// confirm immediately on the result board.
+pub const CONFIRM_TIMEOUT_SECS: u32 = 10;
 /// Seconds to re-party empty seats (bots fill / new humans can join).
 pub const REPARTY_TIMEOUT_SECS: u32 = 60;
 

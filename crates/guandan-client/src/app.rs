@@ -4,13 +4,16 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::KeyCode;
 use guandan_core::{
-    find_card_indices_in_hand, find_cards_in_hand, Card, FinishRank, HandType, Rank, Seat, TeamId,
+    card::sort_hand, find_card_indices_in_hand, find_cards_in_hand, Card, FinishRank, HandType,
+    Rank, Seat, TeamId,
 };
 use guandan_protocol::{
-    ClientMessage, PublicPlay, SeatInfo, ServerMessage, PLAY_REVEAL_SECS, TURN_TIMEOUT_SECS,
+    ClientMessage, PublicPlay, SeatInfo, ServerMessage, CONFIRM_TIMEOUT_SECS, PLAY_REVEAL_SECS,
+    TURN_TIMEOUT_SECS,
 };
 use uuid::Uuid;
 
+use crate::counter::CardCounter;
 use crate::net::NetHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +55,10 @@ pub struct App {
     pub last_play: Option<PublicPlay>,
     pub cursor: usize,
     pub selected: Vec<bool>,
+    /// Toggle: show the 记牌器 panel (C key). Preference persists across hands.
     pub show_counter: bool,
+    /// Remaining-card tracker for the current hand (played history).
+    pub counter: CardCounter,
     pub finish_order: Vec<(Seat, FinishRank)>,
     pub last_hand_result: String,
     pub winner_team: Option<TeamId>,
@@ -73,6 +79,8 @@ pub struct App {
     pub result_finish_order: Vec<Seat>,
     pub result_ranks: Vec<FinishRank>,
     pub my_result_confirmed: bool,
+    /// When the confirm window ends (local Instant; auto-confirm on server).
+    pub confirm_deadline: Option<Instant>,
     pub can_follow: bool,
     pub no_legal_play: bool,
     /// Latest action of each seat in the current trick, by seat.
@@ -112,6 +120,7 @@ impl App {
             cursor: 0,
             selected: Vec::new(),
             show_counter: false,
+            counter: CardCounter::new(),
             finish_order: Vec::new(),
             last_hand_result: String::new(),
             winner_team: None,
@@ -127,6 +136,7 @@ impl App {
             result_finish_order: Vec::new(),
             result_ranks: Vec::new(),
             my_result_confirmed: false,
+            confirm_deadline: None,
             can_follow: true,
             no_legal_play: false,
             trick: Default::default(),
@@ -162,6 +172,13 @@ impl App {
     /// Seconds left on the turn timer (None if not in a timed turn).
     pub fn turn_secs_left(&self) -> Option<u32> {
         let deadline = self.turn_deadline?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        Some(left.as_secs() as u32)
+    }
+
+    /// Seconds left to confirm hand ranks (None if not on the result board).
+    pub fn confirm_secs_left(&self) -> Option<u32> {
+        let deadline = self.confirm_deadline?;
         let left = deadline.saturating_duration_since(Instant::now());
         Some(left.as_secs() as u32)
     }
@@ -267,6 +284,8 @@ impl App {
                 self.reveal_seat = None;
                 self.screen = Screen::Game;
                 self.tribute_mode = false;
+                // Fresh hand → wipe played history (toggle preference keeps).
+                self.counter.reset();
                 self.set_status(format!(
                     "发牌 · 级牌 {} · 先手 座位{}",
                     hand_level.label(),
@@ -274,6 +293,7 @@ impl App {
                 ));
             }
             ServerMessage::TributePaid { from, card, to } => {
+                self.apply_card_transfer(from, to, card);
                 self.set_status(format!(
                     "进贡: 座位{} → 座位{} {}",
                     from + 1,
@@ -294,6 +314,7 @@ impl App {
             }
             ServerMessage::TributeReturned { from, card, to } => {
                 self.tribute_mode = false;
+                self.apply_card_transfer(from, to, card);
                 self.set_status(format!(
                     "回贡: 座位{} → 座位{} {}",
                     from + 1,
@@ -353,6 +374,9 @@ impl App {
                     hand_type: Some(hand_type),
                     pass: false,
                 });
+                // All public plays feed the 记牌器 (hand shrink for self keeps
+                // remaining = total − hand − played correct without double work).
+                self.counter.note_played(&cards);
                 if seat == self.my_seat {
                     let ids: std::collections::HashSet<_> = cards.iter().map(|c| c.id).collect();
                     self.hand.retain(|c| !ids.contains(&c.id));
@@ -408,13 +432,19 @@ impl App {
                 match_over,
                 winner_team,
                 confirmed,
-                ..
+                confirm_timeout_secs,
             } => {
                 self.team_levels = new_levels;
                 self.result_finish_order = finish_order;
                 self.result_ranks = ranks;
                 self.result_confirmed = confirmed;
                 self.my_result_confirmed = confirmed.get(self.my_seat).copied().unwrap_or(false);
+                let secs = if confirm_timeout_secs == 0 {
+                    CONFIRM_TIMEOUT_SECS
+                } else {
+                    confirm_timeout_secs
+                };
+                self.confirm_deadline = Some(Instant::now() + Duration::from_secs(secs as u64));
                 let team = match winning_team {
                     TeamId::A => "队A",
                     TeamId::B => "队B",
@@ -438,6 +468,7 @@ impl App {
             ServerMessage::AllConfirmed { match_over } => {
                 self.my_result_confirmed = true;
                 self.result_confirmed = [true; 4];
+                self.confirm_deadline = None;
                 if match_over {
                     self.set_status("全部确认 · 比赛结束");
                 } else {
@@ -624,6 +655,11 @@ impl App {
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 self.show_counter = !self.show_counter;
+                self.set_status(if self.show_counter {
+                    "记牌器 开 · Card counter ON (C 关闭)"
+                } else {
+                    "记牌器 关 · Card counter OFF"
+                });
             }
             KeyCode::Left | KeyCode::Char('[') => {
                 if self.cursor > 0 {
@@ -800,6 +836,29 @@ impl App {
             .map(|s| s.name.clone())
             .unwrap_or_else(|| format!("座位{}", seat + 1))
     }
+
+    /// Move a card between seats for tribute / return (keeps hand + 记牌器 in sync).
+    fn apply_card_transfer(&mut self, from: Seat, to: Seat, card: Card) {
+        if from == self.my_seat {
+            if let Some(i) = self.hand.iter().position(|c| c.id == card.id) {
+                self.hand.remove(i);
+            } else {
+                // Fallback: match by face if id was remapped.
+                if let Some(i) = self.hand.iter().position(|c| c.rank == card.rank) {
+                    self.hand.remove(i);
+                }
+            }
+        }
+        if to == self.my_seat && !self.hand.iter().any(|c| c.id == card.id) {
+            self.hand.push(card);
+            sort_hand(&mut self.hand, self.hand_level);
+        }
+        if from == self.my_seat || to == self.my_seat {
+            self.selected = vec![false; self.hand.len()];
+            self.cursor = self.cursor.min(self.hand.len().saturating_sub(1));
+            self.counts[self.my_seat] = self.hand.len();
+        }
+    }
 }
 
 pub fn hand_type_cn(t: HandType) -> &'static str {
@@ -854,5 +913,44 @@ mod tests {
         app.reveal_until = None;
         app.tick();
         assert!(app.trick.iter().all(|e| e.is_none()));
+    }
+
+    /// 记牌器 resets on deal, counts opponent plays, and C toggles the panel.
+    #[test]
+    fn card_counter_lifecycle_and_toggle() {
+        let mut app = App::new(NetHandle::dummy());
+        app.my_seat = 0;
+        let hand = guandan_core::card::cards_from_codes(&["SK", "HK", "S3"]);
+        app.on_server(ServerMessage::Deal {
+            hand: hand.clone(),
+            hand_level: Rank::R2,
+            lead: 0,
+            counts: [3, 27, 27, 27],
+        });
+        // 8 kings − 2 in hand = 6 left with others.
+        assert_eq!(app.counter.remaining_of(Rank::RK, &app.hand), 6);
+        assert!(!app.show_counter);
+
+        app.on_server(ServerMessage::CardPlayed {
+            seat: 1,
+            cards: guandan_core::card::cards_from_codes(&["CK", "DK"]),
+            hand_type: HandType::Pair,
+            counts: [3, 25, 27, 27],
+            reveal_secs: 3,
+        });
+        assert_eq!(app.counter.remaining_of(Rank::RK, &app.hand), 4);
+
+        // Toggle on (C).
+        assert!(!app.on_key(KeyCode::Char('c')));
+        assert!(app.show_counter);
+        // Preference survives a new deal; played history does not.
+        app.on_server(ServerMessage::Deal {
+            hand,
+            hand_level: Rank::R5,
+            lead: 1,
+            counts: [3, 27, 27, 27],
+        });
+        assert!(app.show_counter);
+        assert_eq!(app.counter.remaining_of(Rank::RK, &app.hand), 6);
     }
 }

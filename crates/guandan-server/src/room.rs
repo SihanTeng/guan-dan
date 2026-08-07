@@ -515,17 +515,19 @@ impl Room {
         out
     }
 
-    /// Auto-confirm remaining seats when confirm timer expires; deal when all confirmed.
+    /// Auto-confirm bots immediately; when the 10s window expires, force-confirm
+    /// any remaining humans so the next deal is never blocked forever.
     pub fn check_confirm_timeout(&mut self) -> Vec<(Option<Uuid>, ServerMessage)> {
         let Some(deadline) = self.confirm_deadline else {
-            return Vec::new();
+            // Still try bots if we're somehow on the board without a deadline.
+            return self.auto_confirm_bots();
         };
         if Instant::now() < deadline {
-            // Still waiting — bots auto-confirm immediately so only humans block.
+            // Waiting for humans — bots never block the board.
             return self.auto_confirm_bots();
         }
         let mut all = Vec::new();
-        // Force-confirm anyone still pending
+        // Force-confirm anyone still pending (humans who timed out).
         for seat in 0..4 {
             let need = {
                 let Some(g) = &self.game else {
@@ -544,7 +546,9 @@ impl Room {
         all
     }
 
-    fn auto_confirm_bots(&mut self) -> Vec<(Option<Uuid>, ServerMessage)> {
+    /// Confirm result for every bot seat still pending (call on HandResult
+    /// ticks and when a leaver is replaced by a bot on the board).
+    pub fn auto_confirm_bots(&mut self) -> Vec<(Option<Uuid>, ServerMessage)> {
         let mut all = Vec::new();
         for seat in 0..4 {
             let (is_bot, need) = {
@@ -631,27 +635,7 @@ impl Room {
         out
     }
 
-    /// Human left mid-game / between hands → seat vacant for re-party.
-    pub fn vacate_seat(&mut self, seat: Seat, reason: &str) -> Vec<(Option<Uuid>, ServerMessage)> {
-        if seat >= 4 {
-            return Vec::new();
-        }
-        self.slots[seat].session_id = None;
-        self.slots[seat].is_bot = false;
-        self.slots[seat].ready = false;
-        self.slots[seat].name = format!("空位{}", seat + 1);
-        self.reparty_deadline =
-            Some(Instant::now() + Duration::from_secs(REPARTY_TIMEOUT_SECS as u64));
-        vec![(
-            None,
-            ServerMessage::SeatOpened {
-                seat,
-                reason: reason.into(),
-            },
-        )]
-    }
-
-    /// New player takes vacant seat (substitute).
+    /// New player takes vacant seat (substitute), including bot seats between hands.
     pub fn take_seat(
         &mut self,
         session: Uuid,
@@ -687,5 +671,105 @@ impl Room {
             team: team_of(seat),
         };
         Ok(vec![(None, ServerMessage::SeatTaken { seat, info })])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use guandan_core::MatchPhase;
+    use guandan_protocol::CONFIRM_TIMEOUT_SECS;
+
+    fn practice_room() -> Room {
+        let mut room = Room::new("T1".into(), true, GameSettings);
+        room.slots[0].session_id = Some(Uuid::new_v4());
+        room.slots[0].name = "human".into();
+        room.fill_bots();
+        room
+    }
+
+    #[test]
+    fn confirm_timeout_is_ten_seconds() {
+        assert_eq!(CONFIRM_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn bots_auto_confirm_on_hand_over() {
+        let mut room = practice_room();
+        let _ = room.start_game();
+        // Force HandOver with nothing confirmed.
+        {
+            let g = room.game.as_mut().unwrap();
+            g.phase = MatchPhase::HandOver;
+            g.confirmed = [false; 4];
+        }
+        room.confirm_deadline = Some(Instant::now() + Duration::from_secs(10));
+
+        let msgs = room.auto_confirm_bots();
+        assert!(!msgs.is_empty(), "bots should emit confirm events");
+        let g = room.game.as_ref().unwrap();
+        // Seat 0 is human — still pending; bots 1..3 confirmed.
+        assert!(!g.confirmed[0]);
+        assert!(g.confirmed[1] && g.confirmed[2] && g.confirmed[3]);
+    }
+
+    #[test]
+    fn confirm_timeout_force_confirms_humans() {
+        let mut room = practice_room();
+        let _ = room.start_game();
+        {
+            let g = room.game.as_mut().unwrap();
+            g.phase = MatchPhase::HandOver;
+            g.confirmed = [false, true, true, true];
+            // Next deal (hand 2) needs banker/dwellers from the finished hand.
+            g.prev_banker = Some(1);
+            g.prev_dwellers = vec![0];
+            g.finish_order = vec![1, 2, 3, 0];
+        }
+        // Deadline already passed.
+        room.confirm_deadline = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
+
+        let _ = room.check_confirm_timeout();
+        let g = room.game.as_ref().unwrap();
+        // AllConfirmed ran; deal may already have consumed pending_next_deal.
+        assert!(
+            g.confirmed.iter().all(|&c| c)
+                || matches!(
+                    g.phase,
+                    MatchPhase::Playing | MatchPhase::Tribute | MatchPhase::Idle
+                ),
+            "force-confirm advanced the match (phase={:?})",
+            g.phase
+        );
+        // Human seat 0 was force-confirmed (either still Idle post-confirm, or next hand dealt).
+        assert!(
+            matches!(
+                g.phase,
+                MatchPhase::Idle | MatchPhase::Playing | MatchPhase::Tribute
+            ),
+            "expected next phase after force confirm, got {:?}",
+            g.phase
+        );
+    }
+
+    #[test]
+    fn mid_hand_bot_fill_marks_slot_bot() {
+        let mut room = practice_room();
+        let _ = room.start_game();
+        let seat = 0usize;
+        room.slots[seat].session_id = None;
+        room.slots[seat].is_bot = true;
+        room.slots[seat].name = format!("机器人{}", seat + 1);
+        room.slots[seat].ready = true;
+        assert!(room.slots[seat].is_bot);
+        assert!(room.slots[seat].session_id.is_none());
+        // Bot can still act on its turn.
+        {
+            let g = room.game.as_mut().unwrap();
+            g.current = seat;
+            g.phase = MatchPhase::Playing;
+        }
+        // bot_actions should not panic (may pass/play depending on hand).
+        let _ = room.bot_actions();
     }
 }

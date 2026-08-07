@@ -1,6 +1,7 @@
 //! Guandan terminal client (ratatui).
 
 mod app;
+mod counter;
 mod net;
 mod ui;
 

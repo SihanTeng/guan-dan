@@ -12,7 +12,8 @@ use anyhow::Result;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use guandan_protocol::{
-    decode_client, encode_server, ServerMessage, PLAY_REVEAL_SECS, TURN_TIMEOUT_SECS,
+    decode_client, encode_server, ServerMessage, CONFIRM_TIMEOUT_SECS, PLAY_REVEAL_SECS,
+    TURN_TIMEOUT_SECS,
 };
 use settings::GameSettings;
 use state::AppState;
@@ -47,8 +48,8 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState::new(GameSettings));
     let listener = TcpListener::bind(&args.bind).await?;
     info!(
-        "掼蛋服务器监听 {}  ·  turn={}s  reveal={}s (fixed)",
-        args.bind, TURN_TIMEOUT_SECS, PLAY_REVEAL_SECS
+        "掼蛋服务器监听 {}  ·  turn={}s  reveal={}s  confirm={}s (fixed)",
+        args.bind, TURN_TIMEOUT_SECS, PLAY_REVEAL_SECS, CONFIRM_TIMEOUT_SECS
     );
 
     let tick_state = Arc::clone(&state);

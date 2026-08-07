@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use guandan_core::{team_of, Action, MatchPhase};
@@ -71,29 +72,47 @@ impl AppState {
         q.retain(|id| *id != session_id);
     }
 
-    /// Vacate `session_id`'s seat in `rid` (left or disconnected): broadcast
-    /// the departure, bot-fill immediately mid-game so the hand can finish,
-    /// and drop the room once no human sessions remain seated.
+    /// Vacate `session_id`'s seat in `rid` (left or disconnected).
+    ///
+    /// - **Playing / Tribute / HandOver / MatchOver**: bot substitutes
+    ///   immediately so the hand/confirm never soft-locks. Bots auto-confirm
+    ///   the result board. A human may reclaim the seat between hands
+    ///   (`TakeSeat`) for the next round.
+    /// - **Idle / lobby**: seat opens for re-party (bot fill after timeout).
+    /// - Room is dropped once no human sessions remain.
     async fn seat_departed(&self, rid: &str, session_id: Uuid) {
         let mut rooms = self.rooms.lock().await;
         let Some(room) = rooms.get_mut(rid) else {
             return;
         };
+        let mut followup: Vec<(Option<Uuid>, ServerMessage)> = Vec::new();
         if let Some(seat) = room.seat_of(session_id) {
-            let vacate = room.vacate_seat(seat, "玩家离开");
-            let msg = encode_server(&ServerMessage::PlayerLeft { seat }).unwrap();
-            self.broadcast_room_locked(room, None, msg).await;
-            // Mid-game: fill with bot immediately so the hand can finish;
-            // between hands leave vacant for re-party until timeout.
-            let mid_play = room
-                .game
-                .as_ref()
-                .map(|g| matches!(g.phase, MatchPhase::Playing | MatchPhase::Tribute))
-                .unwrap_or(false);
-            if mid_play {
+            let phase = room.game.as_ref().map(|g| g.phase);
+            let needs_bot = matches!(
+                phase,
+                Some(
+                    MatchPhase::Playing
+                        | MatchPhase::Tribute
+                        | MatchPhase::HandOver
+                        | MatchPhase::MatchOver
+                )
+            );
+
+            // Drop the human seat first.
+            room.slots[seat].session_id = None;
+            room.slots[seat].ready = false;
+
+            let left = encode_server(&ServerMessage::PlayerLeft { seat }).unwrap();
+            self.broadcast_room_locked(room, None, left).await;
+
+            if needs_bot {
+                // Immediate bot substitute — plays / confirms for the rest of
+                // this hand; stays until a human TakeSeat between hands.
                 room.slots[seat].is_bot = true;
                 room.slots[seat].name = format!("机器人{}", seat + 1);
                 room.slots[seat].ready = true;
+                // No open re-party window while the seat is bot-filled.
+                room.reparty_deadline = None;
                 let taken = ServerMessage::SeatTaken {
                     seat,
                     info: SeatInfo {
@@ -107,16 +126,24 @@ impl AppState {
                 if let Ok(t) = encode_server(&taken) {
                     self.broadcast_room_locked(room, None, t).await;
                 }
+                // If we're on the result board, confirm for every bot now.
+                if matches!(phase, Some(MatchPhase::HandOver | MatchPhase::MatchOver)) {
+                    followup.extend(room.auto_confirm_bots());
+                }
             } else {
-                for (target, m) in vacate {
-                    if let Ok(t) = encode_server(&m) {
-                        match target {
-                            Some(sid) => {
-                                let _ = self.send_to(sid, t).await;
-                            }
-                            None => self.broadcast_room_locked(room, None, t).await,
-                        }
-                    }
+                // Between hands / lobby: leave vacant for a human substitute.
+                room.slots[seat].is_bot = false;
+                room.slots[seat].name = format!("空位{}", seat + 1);
+                room.reparty_deadline = Some(
+                    Instant::now()
+                        + Duration::from_secs(guandan_protocol::REPARTY_TIMEOUT_SECS as u64),
+                );
+                let opened = ServerMessage::SeatOpened {
+                    seat,
+                    reason: "玩家离开".into(),
+                };
+                if let Ok(t) = encode_server(&opened) {
+                    self.broadcast_room_locked(room, None, t).await;
                 }
             }
         }
@@ -127,6 +154,11 @@ impl AppState {
             .unwrap_or(false);
         if empty {
             rooms.remove(rid);
+            return;
+        }
+        drop(rooms);
+        if !followup.is_empty() {
+            self.dispatch_stored(rid, followup).await;
         }
     }
 
@@ -680,5 +712,173 @@ mod tests {
         assert!(saw_tribute_paid, "tribute never paid in hand 2");
         assert!(saw_return_turn, "no TributeReturnTurn message sent");
         assert!(saw_tribute_returned, "tribute return never completed");
+    }
+
+    /// Leaving mid-hand replaces the human with a bot so the match continues.
+    #[tokio::test]
+    async fn leave_mid_hand_bot_substitutes() {
+        let state = AppState::new(GameSettings);
+        let sid = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel::<String>(8192);
+        state.register(sid, Uuid::new_v4(), tx).await;
+        state
+            .handle(sid, ClientMessage::PracticeMatch)
+            .await
+            .unwrap();
+        // Drain startup messages.
+        while rx.try_recv().is_ok() {}
+
+        // Ensure game is in Playing.
+        {
+            let mut rooms = state.rooms.lock().await;
+            let room = rooms.values_mut().next().unwrap();
+            assert!(room.game.is_some());
+            room.game.as_mut().unwrap().phase = MatchPhase::Playing;
+        }
+
+        state.handle(sid, ClientMessage::LeaveRoom).await.unwrap();
+
+        let rooms = state.rooms.lock().await;
+        // Room may still exist if... wait, all humans gone → room removed.
+        // Practice: only one human; leave empties room.
+        assert!(rooms.is_empty(), "room dropped when last human leaves");
+        drop(rooms);
+
+        // Two humans: leave one, bot fills, room stays.
+        let state = AppState::new(GameSettings);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let (tx_a, _rx_a) = mpsc::channel::<String>(256);
+        let (tx_b, mut rx_b) = mpsc::channel::<String>(256);
+        state.register(a, Uuid::new_v4(), tx_a).await;
+        state.register(b, Uuid::new_v4(), tx_b).await;
+        state
+            .handle(a, ClientMessage::CreateRoom { name: "A".into() })
+            .await
+            .unwrap();
+        let room_id = {
+            let sessions = state.sessions.lock().await;
+            sessions.get(&a).unwrap().room_id.clone().unwrap()
+        };
+        state
+            .handle(
+                b,
+                ClientMessage::JoinRoom {
+                    room_id: room_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        // Fill remaining with bots and start.
+        {
+            let mut rooms = state.rooms.lock().await;
+            let room = rooms.get_mut(&room_id).unwrap();
+            room.fill_bots();
+            for s in room.slots.iter_mut() {
+                s.ready = true;
+            }
+            let msgs = room.start_game();
+            drop(rooms);
+            state.dispatch_stored(&room_id, msgs).await;
+        }
+        {
+            let mut rooms = state.rooms.lock().await;
+            rooms
+                .get_mut(&room_id)
+                .unwrap()
+                .game
+                .as_mut()
+                .unwrap()
+                .phase = MatchPhase::Playing;
+        }
+        while rx_b.try_recv().is_ok() {}
+
+        state.handle(a, ClientMessage::LeaveRoom).await.unwrap();
+
+        let rooms = state.rooms.lock().await;
+        let room = rooms
+            .get(&room_id)
+            .expect("room stays with remaining human");
+        let bots = room.slots.iter().filter(|s| s.is_bot).count();
+        let humans = room.slots.iter().filter(|s| s.session_id.is_some()).count();
+        assert_eq!(humans, 1);
+        assert_eq!(bots, 3, "departed seat becomes bot");
+        // B should have seen SeatTaken or PlayerLeft.
+        drop(rooms);
+        let mut saw_left = false;
+        let mut saw_bot = false;
+        while let Ok(text) = rx_b.try_recv() {
+            if let Ok(sm) = decode_server(&text) {
+                match sm {
+                    ServerMessage::PlayerLeft { .. } => saw_left = true,
+                    ServerMessage::SeatTaken { info, .. } if info.is_bot => saw_bot = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_left, "PlayerLeft broadcast");
+        assert!(saw_bot, "bot SeatTaken broadcast");
+    }
+
+    /// Leaving on the result board: bot fills and auto-confirms that seat.
+    #[tokio::test]
+    async fn leave_on_result_board_bot_confirms() {
+        let state = AppState::new(GameSettings);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let (tx_a, _rx_a) = mpsc::channel::<String>(256);
+        let (tx_b, mut rx_b) = mpsc::channel::<String>(256);
+        state.register(a, Uuid::new_v4(), tx_a).await;
+        state.register(b, Uuid::new_v4(), tx_b).await;
+        state
+            .handle(a, ClientMessage::CreateRoom { name: "A".into() })
+            .await
+            .unwrap();
+        let room_id = {
+            let sessions = state.sessions.lock().await;
+            sessions.get(&a).unwrap().room_id.clone().unwrap()
+        };
+        state
+            .handle(
+                b,
+                ClientMessage::JoinRoom {
+                    room_id: room_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let mut rooms = state.rooms.lock().await;
+            let room = rooms.get_mut(&room_id).unwrap();
+            room.fill_bots();
+            for s in room.slots.iter_mut() {
+                s.ready = true;
+            }
+            let msgs = room.start_game();
+            // Put match on HandOver, only seat b unconfirmed among humans.
+            {
+                let g = room.game.as_mut().unwrap();
+                g.phase = MatchPhase::HandOver;
+                g.confirmed = [false; 4];
+            }
+            room.confirm_deadline = Some(Instant::now() + Duration::from_secs(10));
+            drop(rooms);
+            state.dispatch_stored(&room_id, msgs).await;
+        }
+        while rx_b.try_recv().is_ok() {}
+
+        // A leaves on the board → bot + auto-confirm bots (seats 0,2,3 if bots).
+        state.handle(a, ClientMessage::LeaveRoom).await.unwrap();
+
+        let rooms = state.rooms.lock().await;
+        let room = rooms.get(&room_id).unwrap();
+        let g = room.game.as_ref().unwrap();
+        // Seat of A was 0 (first join); now bot and confirmed.
+        assert!(room.slots[0].is_bot);
+        assert!(g.confirmed[0], "departed seat auto-confirmed as bot");
+        // Other bots confirmed too.
+        assert!(g.confirmed[2] && g.confirmed[3]);
+        // Human B still needs to confirm (or wait 10s).
+        assert!(!g.confirmed[1] || room.slots[1].session_id == Some(b));
     }
 }

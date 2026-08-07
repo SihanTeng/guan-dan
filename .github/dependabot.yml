@@ -1,0 +1,40 @@
+# Dependabot — keep Rust crates and Actions up to date.
+# https://docs.github.com/en/code-security/dependabot
+
+version: 2
+updates:
+  # Cargo workspace (root Cargo.toml + lockfile)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "rust"
+    # Group minor/patch bumps to avoid PR spam; majors stay separate.
+    groups:
+      cargo-minor:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions used by ci.yml / release.yml
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(deps)"
+    labels:
+      - "dependencies"
+      - "github-actions"

@@ -59,9 +59,17 @@ fn draw_help(f: &mut Frame, area: Rect) {
   Enter 出  P 过  ⌫ 删  Esc 清空
   ←→ Space 点选
 
+记牌器
+  C  开/关（本局剩余牌张，不含自己手牌）
+  双副 108 · 面值各 8 · 王各 2
+  数字=他人手中大致剩余（进贡已计入）
+  顶行灰字=点数 · 金色=级牌 · R红=大王
+  底行白字=剩余张数 · 暗灰=已出完(0)
+
 计时（固定）
   每回合 30 秒 · 他人出牌展示 3 秒
-  本局结束：四人确认名次后才开下一局（超时自动确认）
+  本局结束：确认名次 10 秒，超时自动确认
+  机器人立刻确认；中途离开由机器人顶上
 
 H / Esc  关闭";
     draw_popup(f, area, "帮助", text);
@@ -282,5 +290,99 @@ mod tests {
             compact.contains("Enter") || compact.contains("键入"),
             "input line missing:\n{screen}"
         );
+    }
+
+    /// 记牌器 panel paints when toggled on without panicking.
+    #[test]
+    fn game_counter_panel_renders() {
+        use guandan_core::{HandType, Rank};
+        use guandan_protocol::PublicPlay;
+
+        let mut app = App::new(NetHandle::dummy());
+        app.screen = Screen::Game;
+        app.status.clear();
+        app.show_counter = true;
+        app.hand = cards_from_codes(&["S3", "H3", "SK", "HK"]);
+        app.selected = vec![false; app.hand.len()];
+        app.counts = [4, 24, 25, 22];
+        app.current = Some(0);
+        app.hand_level = Rank::R2;
+        app.seats = (0..4)
+            .map(|seat| guandan_protocol::SeatInfo {
+                seat,
+                name: format!("P{seat}"),
+                is_bot: seat != 0,
+                ready: true,
+                team: if seat % 2 == 0 {
+                    guandan_core::TeamId::A
+                } else {
+                    guandan_core::TeamId::B
+                },
+            })
+            .collect();
+        app.counter.note_played(&cards_from_codes(&["CK", "DK"]));
+        app.last_play = Some(PublicPlay {
+            seat: 1,
+            cards: cards_from_codes(&["CK", "DK"]),
+            hand_type: HandType::Pair,
+            key: Rank::RK,
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+        // Header row (ranks) + count row must both paint (ASCII-only grid).
+        assert!(
+            compact.contains('K') && compact.contains('A') && compact.contains('T'),
+            "counter rank headers missing:\n{screen}"
+        );
+        // King remaining after 2 in hand + 2 played = 4.
+        assert!(
+            compact.contains('4'),
+            "counter count cells missing:\n{screen}"
+        );
+
+        // Vertical alignment: every rank glyph must share its x with the digit
+        // under it (col width 2, centered band).
+        let mut hdr_row = None;
+        let mut cnt_row = None;
+        for y in 0..24u16 {
+            let mut line = String::new();
+            for x in 0..80u16 {
+                line.push_str(buf[(x, y)].symbol());
+            }
+            if line.contains('K') && line.contains('T') && line.contains('R') {
+                hdr_row = Some(y);
+            }
+            // Count row has digits under the ranks and sits just below headers.
+            if let Some(hy) = hdr_row {
+                if y == hy + 1 {
+                    cnt_row = Some(y);
+                }
+            }
+        }
+        let hy = hdr_row.expect("header row");
+        let cy = cnt_row.expect("count row under headers");
+        for x in 0..80u16 {
+            let h = buf[(x, hy)].symbol();
+            let c = buf[(x, cy)].symbol();
+            let h_rank = matches!(h.chars().next(), Some(ch) if ch.is_ascii_alphanumeric());
+            if h_rank {
+                let c_digit = matches!(c.chars().next(), Some(ch) if ch.is_ascii_digit());
+                assert!(
+                    c_digit,
+                    "column x={x}: rank '{h}' has no digit under it (got '{c}')\n{screen}"
+                );
+            }
+        }
     }
 }

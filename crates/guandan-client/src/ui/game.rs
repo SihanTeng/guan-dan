@@ -2,16 +2,15 @@
 //!
 //! ```text
 //!   status strip
-//!           [partner chip]
-//!           [partner play]
-//!   [left]  |   felt    |  [right]
-//!           [self chip + play]
+//!   [记牌器 2 lines, optional]
+//!   partner (compact 2 lines)
+//!   [left]  |   felt    |  [right]   ← short mid band
+//!   self (1 line)
 //!   [ hand ……………………………… ]
 //!   input / hints
 //! ```
 //!
-//! Vertical budget targets 24 rows (common terminal): fixed chrome ≤ 7,
-//! mid ≥ 5, hand ≥ 6 so a full card face always fits.
+//! Seat chrome stays thin so the hand and 记牌器 stay readable on 24 rows.
 
 use guandan_core::{Seat, TeamId};
 use ratatui::buffer::Buffer;
@@ -24,6 +23,7 @@ use ratatui::Frame;
 use super::cards::{self, card_strip_lines, render_card_grid, CARD_H, CARD_W};
 use super::theme::{self, ACCENT, BG, MUTED, SURFACE, TEXT, TURN};
 use crate::app::{hand_type_cn, App, TrickEntry};
+use crate::counter::CardCounter;
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     // Leave the last row free when a global status toast will paint over it
@@ -36,27 +36,31 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         area.height.saturating_sub(toast),
     );
 
-    // Vertical budget (24-row terminal, no toast):
-    //   status 1 + partner 3 + self 2 + input 1 = 7 fixed
-    //   remaining shared by mid (Fill 1) and hand (Fill 2)
-    //   so the hand grows faster and can show a second card row.
+    // 记牌器: 2 flat lines (rank + count) — no border box (that ate the headers).
+    let counter_h = if app.show_counter { 2 } else { 0 };
+    // Partner: name + optional play. Self: single compact line.
+    // Mid band stays modest (Fill 1); hand takes the rest (Fill 3).
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // match status strip
-            Constraint::Length(3), // partner (name + play)
-            Constraint::Fill(1),   // left | felt | right
-            Constraint::Length(2), // self
-            Constraint::Fill(2),   // hand — prefer space here
-            Constraint::Length(1), // input
+            Constraint::Length(1),         // match status strip
+            Constraint::Length(counter_h), // 记牌器
+            Constraint::Length(2),         // partner
+            Constraint::Fill(1),           // left | felt | right
+            Constraint::Length(1),         // self
+            Constraint::Fill(3),           // hand
+            Constraint::Length(1),         // input
         ])
         .horizontal_margin(1)
         .split(table);
 
     draw_status_strip(f, app, root[0]);
-    draw_partner(f, app, root[1]);
+    if app.show_counter {
+        draw_counter(f, app, root[1]);
+    }
+    draw_partner(f, app, root[2]);
 
-    let side_w = side_panel_width(root[2].width);
+    let side_w = side_panel_width(root[3].width);
     let mid = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -64,24 +68,24 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Min(16),
             Constraint::Length(side_w),
         ])
-        .split(root[2]);
+        .split(root[3]);
     draw_side_seat(f, app, mid[0], app.relative_seat(1), "左");
     draw_felt(f, app, mid[1]);
     draw_side_seat(f, app, mid[2], app.relative_seat(3), "右");
 
-    draw_self_entry(f, app, root[3]);
-    draw_hand(f, app, root[4]);
-    draw_input(f, app, root[5]);
+    draw_self_entry(f, app, root[4]);
+    draw_hand(f, app, root[5]);
+    draw_input(f, app, root[6]);
 
     if app.screen == crate::app::Screen::HandResult {
         draw_result_board(f, app, area, false);
     }
 }
 
-/// Side panels: ~22% each, clamped so the felt keeps a usable middle.
+/// Side panels: narrow chips so the felt keeps the middle.
 fn side_panel_width(total: u16) -> u16 {
-    let ideal = (total as u32 * 22 / 100) as u16;
-    ideal.clamp(14, 22).min(total.saturating_sub(16) / 2)
+    let ideal = (total as u32 * 18 / 100) as u16;
+    ideal.clamp(12, 16).min(total.saturating_sub(20) / 2)
 }
 
 fn rank_cn(r: guandan_core::FinishRank) -> &'static str {
@@ -123,10 +127,16 @@ fn draw_result_board(f: &mut Frame, app: &App, area: Rect, match_over: bool) {
     }
     body.push('\n');
     let n = app.result_confirmed.iter().filter(|c| **c).count();
+    let timer = app
+        .confirm_secs_left()
+        .map(|s| format!("{s}s"))
+        .unwrap_or_else(|| "--".into());
     if app.my_result_confirmed {
-        body.push_str(&format!("已确认  {n}/4  ·  等待其他人…"));
+        body.push_str(&format!("已确认  {n}/4  ·  等待其他人…  ({timer})"));
     } else {
-        body.push_str("Enter 确认本局名次  (四人全部确认后开下一局)");
+        body.push_str(&format!(
+            "Enter 确认本局名次  ·  {timer} 后自动确认\n(机器人已自动确认)"
+        ));
     }
     if match_over {
         body.push_str("\n比赛结束");
@@ -148,11 +158,31 @@ fn draw_status_strip(f: &mut Frame, app: &App, area: Rect) {
                 .bg(TURN)
                 .add_modifier(Modifier::BOLD),
         ),
-        Some(s) => Span::styled(
-            format!("  {} {} ", app.seat_name(s), timer.trim()),
-            Style::default().fg(MUTED).bg(BG),
-        ),
+        Some(s) => {
+            let name = app.seat_name(s);
+            let short = if name.chars().count() > 6 {
+                name.chars().take(5).collect::<String>() + "…"
+            } else {
+                name
+            };
+            Span::styled(
+                format!("  {short} {timer}"),
+                Style::default().fg(MUTED).bg(BG),
+            )
+        }
         None => Span::raw(""),
+    };
+
+    let counter_badge = if app.show_counter {
+        Span::styled(
+            " 记 ",
+            Style::default()
+                .fg(BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" C记牌 ", Style::default().fg(MUTED).bg(BG))
     };
 
     let line = Line::from(vec![
@@ -176,12 +206,124 @@ fn draw_status_strip(f: &mut Frame, app: &App, area: Rect) {
             format!("{}  ", app.room_id.as_deref().unwrap_or("")),
             Style::default().fg(MUTED).bg(BG),
         ),
+        counter_badge,
         turn,
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
 
-/// Name · team · remaining · finish rank. Compact single-line chip.
+/// Compact 记牌器 painted cell-by-cell so ranks sit **exactly** above counts.
+///
+/// Color legend (kept minimal so the strip stays readable):
+/// - **Header**: muted ranks; **级牌** in warm gold; big joker `R` in soft red
+/// - **Counts**: same bright text for every remaining count; **0** dimmed only
+///
+/// ```text
+///  R B 2 A K Q J T 9 8 7 6 5 4 3
+///  2 2 6 5 5 7 7 7 7 5 5 7 6 5 4
+/// ```
+fn draw_counter(f: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width < 8 {
+        return;
+    }
+    f.render_widget(
+        CounterGrid {
+            cells: app.counter.remaining_row(&app.hand),
+            level: app.hand_level,
+        },
+        area,
+    );
+}
+
+/// One glyph + one gap per rank → column i is at x0 + i*2.
+const COUNTER_COL_W: u16 = 2;
+const COUNTER_COLS: u16 = 15;
+
+struct CounterGrid {
+    cells: [(guandan_core::Rank, u8); 15],
+    level: guandan_core::Rank,
+}
+
+impl Widget for CounterGrid {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        // Fill background.
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                buf[(x, y)].set_style(Style::default().bg(SURFACE));
+            }
+        }
+
+        let grid_w = COUNTER_COLS * COUNTER_COL_W; // 30
+        if area.width < grid_w {
+            // Too narrow: fall back to a single packed count line.
+            let y = area.y;
+            let mut x = area.x;
+            for &(_, n) in &self.cells {
+                if x >= area.x + area.width {
+                    break;
+                }
+                let ch = char::from_digit(n as u32, 10).unwrap_or('?');
+                buf[(x, y)]
+                    .set_symbol(&ch.to_string())
+                    .set_style(Style::default().fg(TEXT).bg(SURFACE));
+                x = x.saturating_add(1);
+            }
+            return;
+        }
+
+        let x0 = area.x + (area.width - grid_w) / 2;
+        let y_hdr = area.y;
+        let y_cnt = if area.height >= 2 { area.y + 1 } else { area.y };
+        let show_hdr = area.height >= 2;
+
+        for (i, (rank, n)) in self.cells.iter().enumerate() {
+            let x = x0 + i as u16 * COUNTER_COL_W;
+            if x >= area.x + area.width {
+                break;
+            }
+            let is_level = *rank == self.level && rank.is_face();
+
+            if show_hdr {
+                let hdr = CardCounter::rank_header(*rank);
+                // Only the *label* row uses special colors — identity of the rank.
+                let hdr_style = if is_level {
+                    // Current 级牌 (逢人配 base).
+                    Style::default()
+                        .fg(theme::WILD)
+                        .bg(SURFACE)
+                        .add_modifier(Modifier::BOLD)
+                } else if matches!(rank, guandan_core::Rank::RedJoker) {
+                    // Match card face: big joker is red.
+                    Style::default()
+                        .fg(theme::INK_RED)
+                        .bg(SURFACE)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED).bg(SURFACE)
+                };
+                buf[(x, y_hdr)].set_symbol(hdr).set_style(hdr_style);
+            }
+
+            // Count row is monochrome: remaining stock, not “warning heat”.
+            // Zero is dimmed so exhausted ranks fade out of attention.
+            let cnt_style = if *n == 0 {
+                Style::default().fg(theme::BORDER).bg(SURFACE)
+            } else {
+                Style::default()
+                    .fg(TEXT)
+                    .bg(SURFACE)
+                    .add_modifier(Modifier::BOLD)
+            };
+            // n is 0..=8 for dual-deck; always one digit.
+            let digit = char::from_digit(*n as u32, 10).unwrap_or('?');
+            buf[(x, y_cnt)]
+                .set_symbol(&digit.to_string())
+                .set_style(cnt_style);
+        }
+    }
+}
+
+/// Compact seat chip: `机器人3 A·13` (no "余" padding).
 fn seat_label(app: &App, seat: Seat) -> String {
     let count = app.counts.get(seat).copied().unwrap_or(0);
     let name = app.seat_name(seat);
@@ -198,9 +340,9 @@ fn seat_label(app: &App, seat: Seat) -> String {
         .finish_order
         .iter()
         .find(|(s, _)| *s == seat)
-        .map(|(_, r)| format!("·{}", rank_cn(*r)))
+        .map(|(_, r)| format!(" {}", rank_cn(*r)))
         .unwrap_or_default();
-    format!("{name} [{team}] 余{count}{out}")
+    format!("{name} {team}·{count}{out}")
 }
 
 fn seat_name_style(app: &App, seat: Seat) -> Style {
@@ -211,33 +353,79 @@ fn seat_name_style(app: &App, seat: Seat) -> Style {
     }
 }
 
-/// Latest action for a seat: pass mark, or card strip + type.
-fn trick_content(app: &App, seat: Seat) -> Vec<Line<'static>> {
+/// One-line summary for embedding next to a seat name.
+fn trick_inline(app: &App, seat: Seat) -> Option<Line<'static>> {
     match app.trick.get(seat).and_then(|t| t.as_ref()) {
-        Some(e) if e.pass => vec![Line::from(Span::styled("不出", Style::default().fg(MUTED)))],
-        Some(e) => trick_play_lines(e, app.hand_level),
-        None => Vec::new(),
+        Some(e) if e.pass => Some(Line::from(Span::styled(
+            "  不出",
+            Style::default().fg(MUTED),
+        ))),
+        Some(e) if !e.cards.is_empty() => {
+            let mut spans = card_strip_lines(&e.cards, app.hand_level)
+                .into_iter()
+                .next()
+                .map(|l| l.spans)
+                .unwrap_or_default();
+            if let Some(ty) = e.hand_type {
+                spans.push(Span::styled(
+                    format!(" {}", hand_type_cn(ty)),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            Some(Line::from(spans))
+        }
+        _ => None,
     }
 }
 
-fn trick_play_lines(e: &TrickEntry, level: guandan_core::Rank) -> Vec<Line<'static>> {
+fn trick_play_lines(
+    e: &TrickEntry,
+    level: guandan_core::Rank,
+    with_type: bool,
+) -> Vec<Line<'static>> {
     let mut lines = card_strip_lines(&e.cards, level);
-    if let Some(ty) = e.hand_type {
-        lines.push(Line::from(Span::styled(
-            hand_type_cn(ty),
-            Style::default().fg(MUTED),
-        )));
+    if with_type {
+        if let Some(ty) = e.hand_type {
+            lines.push(Line::from(Span::styled(
+                hand_type_cn(ty),
+                Style::default().fg(MUTED),
+            )));
+        }
     }
     lines
 }
 
-/// Partner across the top: chip centered, play under it.
+/// Partner: one line name+count, optional second line for play.
 fn draw_partner(f: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let seat = app.relative_seat(2);
     let active = app.current == Some(seat);
+    let chip_style = if active {
+        Style::default().bg(SURFACE)
+    } else {
+        Style::default().bg(BG)
+    };
+
+    // Single-row area: name and play on one line.
+    if area.height == 1 {
+        let mut spans = vec![
+            Span::styled("对家 ", Style::default().fg(MUTED)),
+            Span::styled(seat_label(app, seat), seat_name_style(app, seat)),
+        ];
+        if let Some(play) = trick_inline(app, seat) {
+            spans.push(Span::raw("  "));
+            spans.extend(play.spans);
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans))
+                .alignment(Alignment::Center)
+                .style(chip_style),
+            area,
+        );
+        return;
+    }
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -248,11 +436,6 @@ fn draw_partner(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("对家 ", Style::default().fg(MUTED)),
         Span::styled(seat_label(app, seat), seat_name_style(app, seat)),
     ]);
-    let chip_style = if active {
-        Style::default().bg(SURFACE)
-    } else {
-        Style::default().bg(BG)
-    };
     f.render_widget(
         Paragraph::new(chip)
             .alignment(Alignment::Center)
@@ -260,13 +443,12 @@ fn draw_partner(f: &mut Frame, app: &App, area: Rect) {
         rows[0],
     );
 
-    let play = trick_content(app, seat);
-    if !play.is_empty() {
+    if let Some(play) = trick_inline(app, seat) {
         f.render_widget(Paragraph::new(play).alignment(Alignment::Center), rows[1]);
     }
 }
 
-/// Left / right opponent: bordered panel, name on top, play below.
+/// Left / right opponent: thin bordered chip, top-aligned (no empty padding).
 fn draw_side_seat(f: &mut Frame, app: &App, area: Rect, seat: Seat, label: &str) {
     if area.width < 3 || area.height < 2 {
         return;
@@ -288,28 +470,21 @@ fn draw_side_seat(f: &mut Frame, app: &App, area: Rect, seat: Seat, label: &str)
         return;
     }
 
-    let play = trick_content(app, seat);
-    let mut body: Vec<Line> = vec![Line::from(Span::styled(
+    // Top-aligned: name, then play — no blank spacers, no vertical centering
+    // (centering wasted the mid band when panels were tall).
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         seat_label(app, seat),
         seat_name_style(app, seat),
     ))];
-    if !play.is_empty() {
-        body.push(Line::from(""));
-        body.extend(play);
-    } else {
-        // Idle seat: show a quiet placeholder so the panel isn't blank.
-        body.push(Line::from(""));
-        body.push(Line::from(Span::styled("·", Style::default().fg(MUTED))));
+    match app.trick.get(seat).and_then(|t| t.as_ref()) {
+        Some(e) if e.pass => {
+            lines.push(Line::from(Span::styled("不出", Style::default().fg(MUTED))));
+        }
+        Some(e) => {
+            lines.extend(trick_play_lines(e, app.hand_level, inner.height >= 4));
+        }
+        None => {}
     }
-
-    // Vertically center the chip + play block inside the panel.
-    let used = body.len() as u16;
-    let pad = inner.height.saturating_sub(used) / 2;
-    let mut lines = Vec::with_capacity((pad + used) as usize);
-    for _ in 0..pad {
-        lines.push(Line::from(""));
-    }
-    lines.extend(body);
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -329,24 +504,28 @@ fn draw_felt(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let title = if let Some(ref lp) = app.last_play {
+        // Only show the reveal countdown while it's actually counting down.
         let hold = if revealing {
             let left = app
                 .reveal_until
                 .map(|t| {
                     t.saturating_duration_since(std::time::Instant::now())
                         .as_secs()
+                        .max(1) // never flash "0s"
                 })
-                .unwrap_or(0);
-            format!(" · 展示{left}s")
+                .unwrap_or(1);
+            format!(" · {left}s")
         } else {
             String::new()
         };
-        format!(
-            " 要压 · {} · {}{} ",
-            app.seat_name(lp.seat),
-            hand_type_cn(lp.hand_type),
-            hold
-        )
+        // Keep title short so side panels don't clip it.
+        let who = app.seat_name(lp.seat);
+        let short = if who.chars().count() > 6 {
+            who.chars().take(5).collect::<String>() + "…"
+        } else {
+            who
+        };
+        format!(" {} · {}{} ", short, hand_type_cn(lp.hand_type), hold)
     } else if app.must_lead {
         " 自由出牌 ".into()
     } else {
@@ -451,30 +630,24 @@ impl Widget for FeltCards {
     }
 }
 
-/// Your row under the felt: seat chip + latest action, one or two lines.
+/// Your row under the felt: single compact line (name · count · last play).
 fn draw_self_entry(f: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let seat = app.my_seat;
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(area);
-
-    let chip = Line::from(vec![
+    let mut spans = vec![
         Span::styled("你 ", Style::default().fg(MUTED)),
         Span::styled(seat_label(app, seat), seat_name_style(app, seat)),
-    ]);
-    f.render_widget(Paragraph::new(chip).alignment(Alignment::Center), rows[0]);
-
-    if rows[1].height == 0 {
-        return;
+    ];
+    if let Some(play) = trick_inline(app, seat) {
+        spans.push(Span::raw("  "));
+        spans.extend(play.spans);
     }
-    let play = trick_content(app, seat);
-    if !play.is_empty() {
-        f.render_widget(Paragraph::new(play).alignment(Alignment::Center), rows[1]);
-    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+        area,
+    );
 }
 
 fn draw_hand(f: &mut Frame, app: &App, area: Rect) {
@@ -632,7 +805,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         ])
     } else {
         Line::from(Span::styled(
-            "  键入 34567 / KK    Enter 出    P 过    ←→ Space 点选    H 帮助",
+            "  键入 34567 / KK    Enter 出    P 过    ←→ Space 点选    C 记牌    H 帮助",
             Style::default().fg(MUTED).bg(BG),
         ))
     };

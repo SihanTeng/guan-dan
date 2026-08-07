@@ -83,47 +83,39 @@ fn decide_tribute(m: &Match, seat: Seat) -> BotDecision {
             return_tribute: None,
         };
     }
-    // Return lowest card rank ≤ 10 to first payer that paid us
+    // Return lowest card rank ≤ 10 to the payer who paid this seat.
+    // paid[i] was received by returners[i] (core pushes them in the same order).
     let hand = &m.players[seat].hand;
     let mut candidates: Vec<&Card> = hand
         .iter()
         .filter(|c| (c.rank as u8) >= 2 && (c.rank as u8) <= 10)
         .collect();
     candidates.sort_by_key(|c| c.rank as u8);
-    let Some(card) = candidates.first() else {
-        // fallback any lowest
-        let card = hand.iter().min_by_key(|c| c.rank as u8).unwrap();
-        let to = trib.payers[0];
-        return BotDecision {
-            play: None,
-            pass: false,
-            return_tribute: Some((card.id, to)),
-        };
+    // Core only enforces the ≤10 rule when the hand holds such a card; if none
+    // exists, fall back to the lowest card so the return always succeeds.
+    let card = match candidates.first() {
+        Some(c) => *c,
+        None => match hand.iter().min_by_key(|c| c.rank as u8) {
+            Some(c) => c,
+            None => {
+                return BotDecision {
+                    play: None,
+                    pass: false,
+                    return_tribute: None,
+                }
+            }
+        },
     };
-    // Prefer payer who paid this seat
+    let idx = trib.returners.iter().position(|&s| s == seat).unwrap_or(0);
     let to = trib
         .paid
-        .iter()
-        .find(|(_, _c)| {
-            // who paid to us: paid.to was seat — we stored (from, card) and events had to
-            // Our TributeState.paid is (from_dweller, card); receiver is banker/follower
-            true
-        })
+        .get(idx)
         .map(|(d, _)| *d)
         .unwrap_or(trib.payers[0]);
-    // Map: if we are banker/follower, return to corresponding payer
-    let to = if trib.paid.len() == 1 {
-        trib.paid[0].0
-    } else {
-        // match returner order to payer order roughly
-        let idx = trib.returners.iter().position(|&s| s == seat).unwrap_or(0);
-        trib.paid.get(idx).map(|(d, _)| *d).unwrap_or(to)
-    };
-    let _ = card;
     BotDecision {
         play: None,
         pass: false,
-        return_tribute: Some((candidates[0].id, to)),
+        return_tribute: Some((card.id, to)),
     }
 }
 

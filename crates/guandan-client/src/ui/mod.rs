@@ -91,8 +91,10 @@ fn draw_match_over(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(crate) fn draw_popup(f: &mut Frame, area: Rect, title: &str, text: &str) {
-    let w = area.width.clamp(36, 56);
-    let h = area.height.clamp(12, 20);
+    // Never size the popup past the available area — ratatui's Clear panics
+    // on out-of-bounds cells, and a small terminal pane must not crash us.
+    let w = area.width.min(56);
+    let h = area.height.min(20);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -123,4 +125,162 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(format!("  {}  ", app.status)).style(Style::default().fg(MUTED).bg(SURFACE)),
         rect,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::net::NetHandle;
+    use guandan_core::card::cards_from_codes;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render_at(w: u16, h: u16, app: &App) {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+    }
+
+    /// Every screen must render without panicking at any terminal size —
+    /// including panes smaller than the popup minimums.
+    #[test]
+    fn screens_render_at_any_size() {
+        let mut app = App::new(NetHandle::dummy());
+        app.screen = Screen::Game;
+        app.hand = cards_from_codes(&["S3", "H4", "C5", "D6", "S7", "H8", "C9"]);
+        app.selected = vec![false; app.hand.len()];
+        app.counts = [7, 20, 17, 24];
+        app.current = Some(0);
+        app.seats = (0..4)
+            .map(|seat| guandan_protocol::SeatInfo {
+                seat,
+                name: format!("玩家{seat}"),
+                is_bot: seat != 0,
+                ready: true,
+                team: if seat % 2 == 0 {
+                    guandan_core::TeamId::A
+                } else {
+                    guandan_core::TeamId::B
+                },
+            })
+            .collect();
+        for &(w, h) in &[(80, 24), (120, 40), (40, 12), (30, 10), (20, 6)] {
+            render_at(w, h, &app);
+        }
+
+        // Popup screens (help / result) on tiny panes used to panic via Clear.
+        app.screen = Screen::Help;
+        app.prev_screen = Screen::Game;
+        for &(w, h) in &[(80, 24), (30, 10), (20, 6), (10, 4)] {
+            render_at(w, h, &app);
+        }
+
+        app.screen = Screen::HandResult;
+        app.result_finish_order = vec![0, 2, 1, 3];
+        app.result_ranks = vec![
+            guandan_core::FinishRank::Banker,
+            guandan_core::FinishRank::Follower,
+            guandan_core::FinishRank::Third,
+            guandan_core::FinishRank::Dweller,
+        ];
+        for &(w, h) in &[(80, 24), (30, 10), (20, 6)] {
+            render_at(w, h, &app);
+        }
+    }
+
+    /// Table layout must show the hand (card faces) and seat labels on a
+    /// standard 80×24 terminal — the previous Min/Min split squeezed the
+    /// hand below CARD_H and cards vanished.
+    #[test]
+    fn game_table_shows_hand_on_80x24() {
+        use crate::app::TrickEntry;
+        use guandan_core::{HandType, Rank};
+        use guandan_protocol::PublicPlay;
+
+        let mut app = App::new(NetHandle::dummy());
+        app.screen = Screen::Game;
+        app.status.clear();
+        app.my_seat = 0;
+        app.hand = cards_from_codes(&[
+            "S3", "H3", "C4", "D5", "S6", "H7", "C8", "D9", "S10", "HJ", "CQ", "DK", "SA",
+        ]);
+        app.selected = vec![false; app.hand.len()];
+        app.selected[0] = true;
+        app.cursor = 0;
+        app.counts = [13, 24, 25, 22];
+        app.current = Some(0);
+        app.hand_level = Rank::R2;
+        app.team_levels = [Rank::R5, Rank::R3];
+        app.room_id = Some("ABCD".into());
+        app.seats = (0..4)
+            .map(|seat| guandan_protocol::SeatInfo {
+                seat,
+                name: format!("P{seat}"),
+                is_bot: seat != 0,
+                ready: true,
+                team: if seat % 2 == 0 {
+                    guandan_core::TeamId::A
+                } else {
+                    guandan_core::TeamId::B
+                },
+            })
+            .collect();
+        app.last_play = Some(PublicPlay {
+            seat: 1,
+            cards: cards_from_codes(&["S5", "H5"]),
+            hand_type: HandType::Pair,
+            key: Rank::R5,
+        });
+        app.trick[1] = Some(TrickEntry {
+            cards: cards_from_codes(&["S5", "H5"]),
+            hand_type: Some(HandType::Pair),
+            pass: false,
+        });
+        app.trick[2] = Some(TrickEntry {
+            cards: vec![],
+            hand_type: None,
+            pass: true,
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let mut screen = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+
+        // TestBackend stores wide glyphs as char + trailing space, so
+        // multi-byte CJK substrings may not match contiguously.
+        let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Partner / sides / self labels (table geometry).
+        assert!(compact.contains("对家"), "partner label missing:\n{screen}");
+        assert!(compact.contains("左"), "left seat missing:\n{screen}");
+        assert!(compact.contains("右"), "right seat missing:\n{screen}");
+        assert!(compact.contains("你"), "self label missing:\n{screen}");
+        // Hand faces must paint (not an empty box).
+        assert!(
+            screen.contains('┌') && screen.contains('│'),
+            "card borders missing:\n{screen}"
+        );
+        // Rank from hand should appear (3 of spades is selected).
+        assert!(compact.contains('3'), "hand rank glyphs missing:\n{screen}");
+        // Felt title for play-to-beat.
+        assert!(
+            compact.contains("要压") || compact.contains("对子"),
+            "felt / last-play missing:\n{screen}"
+        );
+        // Input line is not clobbered by the status toast.
+        assert!(
+            compact.contains("Enter") || compact.contains("键入"),
+            "input line missing:\n{screen}"
+        );
+    }
 }

@@ -32,7 +32,7 @@ impl NetHandle {
             }
         });
 
-        // Reader
+        // Reader — when the socket dies, tell the app instead of going zombie.
         tokio::spawn(async move {
             while let Some(Ok(msg)) = stream.next().await {
                 if let Message::Text(text) = msg {
@@ -43,6 +43,9 @@ impl NetHandle {
                     }
                 }
             }
+            let _ = in_tx.send(ServerMessage::Error {
+                message: "与服务器断开连接 · Disconnected".into(),
+            });
         });
 
         Ok((Self { tx: out_tx }, in_rx))
@@ -50,5 +53,12 @@ impl NetHandle {
 
     pub fn send(&self, msg: ClientMessage) {
         let _ = self.tx.send(msg);
+    }
+
+    #[cfg(test)]
+    /// Test-only handle whose sends go nowhere.
+    pub fn dummy() -> Self {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMessage>();
+        Self { tx }
     }
 }

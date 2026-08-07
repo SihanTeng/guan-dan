@@ -1,8 +1,10 @@
 //! Hand comparison and move search.
 
-use super::parse::{key_beats, parse_hand, HandType, ParsedHand};
+use super::parse::{
+    key_beats, key_beats_natural, parse_hand, straight_shapes, HandType, ParsedHand,
+};
 use super::BombTier;
-use crate::card::{play_strength, Card, Rank};
+use crate::card::{play_strength, Card, Rank, Suit};
 
 /// Whether the player has any legal follow/bomb against `last` (or can always lead).
 pub fn can_follow(hand: &[Card], last: Option<&ParsedHand>, level: Rank) -> bool {
@@ -44,6 +46,11 @@ pub fn can_beat(new_hand: &ParsedHand, last_hand: &ParsedHand, level: Rank) -> b
     if new_hand.length != last_hand.length {
         return false;
     }
+    // Sequences compare by natural face order; the level card participates
+    // at its natural value.
+    if matches!(new_hand.ty, HandType::Straight | HandType::StraightFlush) {
+        return key_beats_natural(new_hand.key, last_hand.key);
+    }
     key_beats(new_hand.key, last_hand.key, level)
 }
 
@@ -61,7 +68,7 @@ fn bomb_beats(new_hand: &ParsedHand, last_hand: &ParsedHand, level: Rank) -> boo
             }
             key_beats(new_hand.key, last_hand.key, level)
         }
-        BombTier::StraightFlush => key_beats(new_hand.key, last_hand.key, level),
+        BombTier::StraightFlush => key_beats_natural(new_hand.key, last_hand.key),
         BombTier::Four | BombTier::Five => key_beats(new_hand.key, last_hand.key, level),
         BombTier::JokerBomb => false,
     }
@@ -75,7 +82,7 @@ pub fn find_smallest_beater(hand: &[Card], last: &ParsedHand, level: Rank) -> Op
     // Generate combinations of appropriate sizes
     let sizes = relevant_sizes(last);
     for size in sizes {
-        for combo in combinations(hand, size) {
+        for combo in combinations(hand, size, level) {
             if let Ok(parsed) = parse_hand(&combo, level) {
                 if can_beat(&parsed, last, level) {
                     let score = combo_score(&parsed, level);
@@ -129,7 +136,11 @@ pub fn find_smallest_lead(hand: &[Card], level: Rank) -> Option<Vec<Card>> {
 }
 
 fn combo_score(parsed: &ParsedHand, level: Rank) -> u8 {
-    let mut s = play_strength(parsed.key, level);
+    // Sequences score by natural face order, matching can_beat.
+    let mut s = match parsed.ty {
+        HandType::Straight | HandType::StraightFlush => parsed.key as u8,
+        _ => play_strength(parsed.key, level),
+    };
     if parsed.ty.is_bomb() {
         s = s.saturating_add(50);
     }
@@ -154,19 +165,21 @@ fn relevant_sizes(last: &ParsedHand) -> Vec<usize> {
 }
 
 /// Generate all combinations of `k` cards from `hand`.
-fn combinations(hand: &[Card], k: usize) -> Vec<Vec<Card>> {
+fn combinations(hand: &[Card], k: usize, level: Rank) -> Vec<Vec<Card>> {
     if k == 0 || k > hand.len() {
         return Vec::new();
     }
-    // Large hands: rank-grouped + limited raw (no recursion into this path)
-    if k >= 4 || hand.len() > 18 {
-        return smart_combinations(hand, k);
+    // Small sets are cheap to enumerate fully (C(27,3) = 2925 max).
+    if k <= 3 {
+        return raw_combinations(hand, k);
     }
-    raw_combinations(hand, k)
+    smart_combinations(hand, k, level)
 }
 
-/// Rank-aware candidate generation for bombs / larger sets.
-fn smart_combinations(hand: &[Card], k: usize) -> Vec<Vec<Card>> {
+/// Rank-aware candidate generation for bombs and structured combos. Stays
+/// complete at any hand size by generating shapes directly instead of
+/// brute-force enumeration.
+fn smart_combinations(hand: &[Card], k: usize, level: Rank) -> Vec<Vec<Card>> {
     let mut out = Vec::new();
     let mut groups: std::collections::HashMap<Rank, Vec<Card>> = std::collections::HashMap::new();
     for &c in hand {
@@ -180,14 +193,9 @@ fn smart_combinations(hand: &[Card], k: usize) -> Vec<Vec<Card>> {
         }
     }
 
-    // Wild + rank bombs: include heart level cards mixed in by raw when hand small enough
-    if (4..=8).contains(&k) && hand.len() <= 16 {
-        // already covered partially; also try mixtures of wilds with a rank
-        let wilds: Vec<Card> = hand
-            .iter()
-            .copied()
-            .filter(|c| c.suit == crate::card::Suit::Heart)
-            .collect();
+    // Wild + rank bombs: mix heart level cards into each rank group
+    let wilds: Vec<Card> = hand.iter().copied().filter(|c| c.is_wild(level)).collect();
+    if (4..=8).contains(&k) && !wilds.is_empty() {
         for (rank, group) in &groups {
             if rank.is_joker() {
                 continue;
@@ -204,13 +212,6 @@ fn smart_combinations(hand: &[Card], k: usize) -> Vec<Vec<Card>> {
         }
     }
 
-    if k == 5 && hand.len() <= 18 {
-        out.extend(raw_combinations(hand, 5));
-    }
-    if k == 6 && hand.len() <= 14 {
-        out.extend(raw_combinations(hand, 6));
-    }
-
     if k == 4 {
         let jokers: Vec<Card> = hand.iter().copied().filter(|c| c.rank.is_joker()).collect();
         if jokers.len() >= 4 {
@@ -218,7 +219,84 @@ fn smart_combinations(hand: &[Card], k: usize) -> Vec<Vec<Card>> {
         }
     }
 
+    if k == 5 {
+        // Full house shapes
+        for &t in &Rank::FACES {
+            for &p in &Rank::FACES {
+                if t != p {
+                    if let Some(c) = shaped_combo(hand, level, &[(t, 3), (p, 2)], None) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        // Straight and straight-flush shapes
+        for shape in straight_shapes() {
+            let need: Vec<(Rank, usize)> = shape.iter().map(|&r| (r, 1)).collect();
+            if let Some(c) = shaped_combo(hand, level, &need, None) {
+                out.push(c);
+            }
+            for suit in [Suit::Spade, Suit::Heart, Suit::Club, Suit::Diamond] {
+                if let Some(c) = shaped_combo(hand, level, &need, Some(suit)) {
+                    out.push(c);
+                }
+            }
+        }
+    }
+
+    if k == 6 {
+        // Tubes (3 consecutive pairs) and plates (2 consecutive triples)
+        for start in 0..=10u8 {
+            if let [Some(r0), Some(r1), Some(r2)] =
+                [start, start + 1, start + 2].map(Rank::from_face_index)
+            {
+                if let Some(c) = shaped_combo(hand, level, &[(r0, 2), (r1, 2), (r2, 2)], None) {
+                    out.push(c);
+                }
+            }
+        }
+        for start in 0..=11u8 {
+            if let [Some(r0), Some(r1)] = [start, start + 1].map(Rank::from_face_index) {
+                if let Some(c) = shaped_combo(hand, level, &[(r0, 3), (r1, 3)], None) {
+                    out.push(c);
+                }
+            }
+        }
+    }
+
     out
+}
+
+/// Build one combo covering `need` (rank -> count) from `hand`: natural
+/// (non-wild) cards of each rank first, wilds filling the gaps. When `suit`
+/// is given, natural cards must share it (straight flush search).
+fn shaped_combo(
+    hand: &[Card],
+    level: Rank,
+    need: &[(Rank, usize)],
+    suit: Option<Suit>,
+) -> Option<Vec<Card>> {
+    let mut wilds: Vec<Card> = hand.iter().copied().filter(|c| c.is_wild(level)).collect();
+    let mut combo = Vec::new();
+    for &(rank, count) in need {
+        let fixed: Vec<Card> = hand
+            .iter()
+            .copied()
+            .filter(|c| c.rank == rank && !c.is_wild(level))
+            .filter(|c| match suit {
+                Some(s) => c.suit == s,
+                None => true,
+            })
+            .take(count)
+            .collect();
+        let missing = count - fixed.len();
+        if wilds.len() < missing {
+            return None;
+        }
+        combo.extend(fixed);
+        combo.extend(wilds.drain(..missing));
+    }
+    Some(combo)
 }
 
 fn raw_combinations(hand: &[Card], k: usize) -> Vec<Vec<Card>> {
@@ -319,5 +397,56 @@ mod tests {
         let hand = cards_from_codes(&["S2", "H5", "C5", "SA"]);
         let beat = find_smallest_beater(&hand, &last, level).unwrap();
         assert_eq!(beat.len(), 1);
+    }
+
+    /// Straights compare by natural face order: at level 6 the straight
+    /// 2-3-4-5-6 must NOT beat 10-J-Q-K-A (the level card plays at its
+    /// natural value inside sequences).
+    #[test]
+    fn straight_compares_by_natural_rank() {
+        let level = Rank::R6;
+        let low = parse_hand(&cards_from_codes(&["S2", "H3", "C4", "D5", "S6"]), level).unwrap();
+        let high = parse_hand(&cards_from_codes(&["ST", "HJ", "CQ", "DK", "SA"]), level).unwrap();
+        assert_eq!(low.ty, HandType::Straight);
+        assert_eq!(high.ty, HandType::Straight);
+        assert!(!can_beat(&low, &high, level));
+        assert!(can_beat(&high, &low, level));
+
+        // …while the level card still outranks A in plain sets
+        let sixes = parse_hand(&cards_from_codes(&["S6", "C6"]), level).unwrap();
+        let aces = parse_hand(&cards_from_codes(&["SA", "HA"]), level).unwrap();
+        assert!(can_beat(&sixes, &aces, level));
+    }
+
+    #[test]
+    fn straight_flush_compares_by_natural_rank() {
+        let level = Rank::R6;
+        let low = parse_hand(&cards_from_codes(&["S2", "S3", "S4", "S5", "S6"]), level).unwrap();
+        let high = parse_hand(&cards_from_codes(&["HT", "HJ", "HQ", "HK", "HA"]), level).unwrap();
+        assert_eq!(low.ty, HandType::StraightFlush);
+        assert_eq!(high.ty, HandType::StraightFlush);
+        assert!(!can_beat(&low, &high, level));
+        assert!(can_beat(&high, &low, level));
+    }
+
+    /// With 19+ cards, straights/fulls/tubes used to be invisible to the
+    /// beater search. The shape-directed generator must find them.
+    #[test]
+    fn finds_straight_beater_in_large_hand() {
+        let level = Rank::R2;
+        let last = parse_hand(&cards_from_codes(&["H3", "D4", "C5", "H6", "D7"]), level).unwrap();
+        assert_eq!(last.ty, HandType::Straight);
+        // 21-card hand: junk pairs plus the 4-5-6-7-8 straight
+        let hand = cards_from_codes(&[
+            "S2", "C2", "S3", "C3", "S9", "C9", "SJ", "CJ", "SQ", "CQ", "SK", "CK", "SA", "CA",
+            "ST", "CT", "S4", "D5", "S6", "D7", "S8",
+        ]);
+        assert_eq!(hand.len(), 21);
+        let beater = find_smallest_beater(&hand, &last, level).expect("a straight beater exists");
+        let p = parse_hand(&beater, level).unwrap();
+        assert_eq!(p.ty, HandType::Straight);
+        assert_eq!(p.key, Rank::R8);
+        assert!(can_beat(&p, &last, level));
+        assert!(can_follow(&hand, Some(&last), level));
     }
 }

@@ -240,6 +240,22 @@ impl Match {
         self.team_levels[team.index()]
     }
 
+    /// Anti-tribute: the dweller(s) collectively hold both red jokers
+    /// (a single dweller holding both, or each double-dweller holding one).
+    fn anti_tribute(&self, dwellers: &[Seat]) -> bool {
+        let red_jokers: usize = dwellers
+            .iter()
+            .map(|&d| {
+                self.players[d]
+                    .hand
+                    .iter()
+                    .filter(|c| c.rank == Rank::RedJoker)
+                    .count()
+            })
+            .sum();
+        red_jokers >= 2
+    }
+
     pub fn apply<R: Rng + ?Sized>(
         &mut self,
         seat: Seat,
@@ -344,29 +360,22 @@ impl Match {
         let dwellers = self.prev_dwellers.clone();
         let banker = self.prev_banker.expect("banker after first hand");
 
-        // Anti-tribute: any dweller holds both red jokers
-        let anti = dwellers.iter().any(|&d| {
-            self.players[d]
-                .hand
-                .iter()
-                .filter(|c| c.rank == Rank::RedJoker)
-                .count()
-                >= 2
-        });
-
-        events.push(Event::Dealt {
-            hands_len: [27; 4],
-            hand_level: self.hand_level,
-            lead: 0, // updated below
-        });
+        // Anti-tribute: the dweller(s) collectively hold both red jokers
+        // (a single dweller holding both, or each double-dweller holding one).
+        let anti = self.anti_tribute(&dwellers);
 
         if anti {
-            events.push(Event::AntiTribute {
-                dwellers: dwellers.clone(),
-            });
             self.lead_seat = banker;
             self.current = banker;
             self.phase = MatchPhase::Playing;
+            events.push(Event::Dealt {
+                hands_len: [27; 4],
+                hand_level: self.hand_level,
+                lead: banker,
+            });
+            events.push(Event::AntiTribute {
+                dwellers: dwellers.clone(),
+            });
             events.push(Event::Turn {
                 seat: self.current,
                 must_lead: true,
@@ -374,9 +383,11 @@ impl Match {
             return Ok(events);
         }
 
-        // Auto-pay tribute: each dweller gives highest non-heart-level card
+        // Auto-pay tribute: each dweller gives highest non-heart-level card.
+        // Payments are applied now but reported after Dealt.
         let mut paid: Vec<(Seat, Card)> = Vec::new();
         let mut returners = Vec::new();
+        let mut paid_events = Vec::new();
         if dwellers.len() == 1 {
             let d = dwellers[0];
             let card = take_tribute_card(&mut self.players[d].hand, self.hand_level)
@@ -385,11 +396,13 @@ impl Match {
             sort_hand(&mut self.players[banker].hand, self.hand_level);
             paid.push((d, card));
             returners.push(banker);
-            events.push(Event::TributePaid {
+            paid_events.push(Event::TributePaid {
                 from: d,
                 card,
                 to: banker,
             });
+            // Single dweller leads once the return is done.
+            self.lead_seat = d;
         } else if dwellers.len() == 2 {
             // Double dweller: both pay to winning team (banker + follower)
             let follower = self.finish_order.get(1).copied().unwrap_or(partner(banker));
@@ -413,13 +426,20 @@ impl Match {
                 self.players[to].hand.push(card);
                 sort_hand(&mut self.players[to].hand, self.hand_level);
                 paid.push((*d, card));
-                events.push(Event::TributePaid { from: *d, card, to });
+                paid_events.push(Event::TributePaid { from: *d, card, to });
             }
             returners.push(banker);
             returners.push(follower);
             // Lead = who paid higher tribute
             self.lead_seat = tributes[0].0;
         }
+
+        events.push(Event::Dealt {
+            hands_len: [27; 4],
+            hand_level: self.hand_level,
+            lead: self.lead_seat,
+        });
+        events.extend(paid_events);
 
         self.tribute = Some(TributeState {
             payers: dwellers,
@@ -428,8 +448,13 @@ impl Match {
             pending_returns: returners,
         });
         self.phase = MatchPhase::Tribute;
-        // Wait for returns; current = first returner
+        // Wait for returns; current = first returner. Emit a Turn so clients
+        // (and the server deadline) know a tribute return is expected.
         self.current = self.tribute.as_ref().unwrap().pending_returns[0];
+        events.push(Event::Turn {
+            seat: self.current,
+            must_lead: false,
+        });
         Ok(events)
     }
 
@@ -446,7 +471,23 @@ impl Match {
         if trib.pending_returns.first().copied() != Some(seat) {
             return Err(MatchError::NotYourTurn);
         }
-        // Return card must be rank ≤ 10 (face 2..10)
+        // Return card must be rank ≤ 10 (face 2..10). If the returner holds no
+        // such card at all (pathological), accept any card so the hand can
+        // proceed instead of wedging the state machine.
+        let has_small = self.players[seat].hand.iter().any(|c| {
+            matches!(
+                c.rank,
+                Rank::R2
+                    | Rank::R3
+                    | Rank::R4
+                    | Rank::R5
+                    | Rank::R6
+                    | Rank::R7
+                    | Rank::R8
+                    | Rank::R9
+                    | Rank::R10
+            )
+        });
         let pos = self.players[seat]
             .hand
             .iter()
@@ -465,7 +506,7 @@ impl Match {
                 | Rank::R9
                 | Rank::R10
         );
-        if !ok_rank {
+        if !ok_rank && has_small {
             return Err(MatchError::BadTributeReturn);
         }
         // Must return to a payer who paid this returner — simple: to_seat must be a payer
@@ -486,11 +527,7 @@ impl Match {
         }];
 
         if trib.pending_returns.is_empty() {
-            // Start play: lead is highest tribute payer (or single dweller)
-            if trib.paid.len() == 1 {
-                self.lead_seat = trib.paid[0].0;
-            }
-            // else lead_seat already set in double case
+            // Lead seat was fixed at deal time (highest tribute payer).
             self.current = self.lead_seat;
             self.phase = MatchPhase::Playing;
             self.tribute = None;
@@ -500,6 +537,10 @@ impl Match {
             });
         } else {
             self.current = trib.pending_returns[0];
+            events.push(Event::Turn {
+                seat: self.current,
+                must_lead: false,
+            });
         }
         Ok(events)
     }
@@ -515,17 +556,19 @@ impl Match {
             return Err(MatchError::NotYourTurn);
         }
 
-        let cards = take_cards(&mut self.players[seat].hand, card_ids)?;
+        // Validate everything before mutating: ids must be unique and present,
+        // the hand must parse, and it must beat the last play. Only then
+        // remove the cards — a rejected play must never change state.
+        let cards = collect_cards(&self.players[seat].hand, card_ids)?;
         let parsed = parse_hand(&cards, self.hand_level)?;
 
         if let Some(ref last) = self.last_play {
             if !can_beat(&parsed, last, self.hand_level) {
-                // put cards back
-                self.players[seat].hand.extend(cards);
-                sort_hand(&mut self.players[seat].hand, self.hand_level);
                 return Err(MatchError::CannotBeat);
             }
         }
+
+        remove_cards(&mut self.players[seat].hand, card_ids);
 
         let mut events = vec![Event::Played {
             seat,
@@ -589,8 +632,17 @@ impl Match {
         let active = (0..4)
             .filter(|&s| self.players[s].finished.is_none())
             .count();
-        // Need (active - 1) passes to end trick, or 3 passes classic
-        let need = (active.saturating_sub(1)).max(1) as u8;
+        // Trick ends when everyone but the last player has passed. If the last
+        // player already went out, every remaining active player must pass.
+        let leader_finished = self
+            .last_player
+            .is_some_and(|lp| self.players[lp].finished.is_some());
+        let need = (if leader_finished {
+            active
+        } else {
+            active.saturating_sub(1)
+        })
+        .max(1) as u8;
 
         if self.passes >= need {
             // Trick ends; last player leads (or partner if out)
@@ -649,19 +701,17 @@ impl Match {
 
         let ti = winning_team.index();
         let old = self.team_levels[ti];
-        // Ace win restriction
+        // Ace win rule: at level A the team must take 头游 with the partner not
+        // 下游 — i.e. finish 1st&2nd or 1st&3rd. 1st&4th keeps them at A
+        // (advance saturates at A) and the hand passes to the next deal.
         let was_at_ace = old == Rank::RA;
-        let partner_was_prev_dweller =
-            self.prev_dwellers.contains(&partner_seat) || self.prev_dwellers.contains(&banker);
-        // Wikipedia: cannot win on a hand where one of the partners is the Dweller from previous hand
-        let blocked = was_at_ace && partner_was_prev_dweller;
+        let ace_converted = was_at_ace && partner_place <= 2;
 
         self.team_levels[ti] = old.advance(level_gain);
 
         let mut match_over = false;
         let mut winner_team = None;
-        if was_at_ace && !blocked {
-            // Winning a hand while already at Ace wins the match
+        if ace_converted {
             match_over = true;
             winner_team = Some(winning_team);
             self.winner_team = winner_team;
@@ -671,24 +721,10 @@ impl Match {
         }
         self.confirmed = [false; 4];
 
-        // If we advanced TO ace and won this hand from below ace, need another hand to claim
-        // (only win when already at ace before the hand). Correct per Wikipedia.
-
         self.prev_banker = Some(banker);
-        self.prev_dwellers = self
-            .finish_order
-            .iter()
-            .copied()
-            .filter(|&s| team_of(s) != winning_team)
-            .collect();
-        // Actually dwellers are the losing team members still not out first — standard:
-        // Dweller = last place; Double-Dweller = last two if both losing?
-        // Losing team seats that finished 3rd/4th or just last:
-        // For tribute: the Dweller(s) — if Double-Dweller, both of last two when partner of banker is follower?
-        // Simpler: prev_dwellers = seats with FinishRank::Dweller, and if partner of banker is Follower
-        // then losing team both are "dwellers" for double? Wikipedia: Double-Dweller when both of last two.
+        // Dwellers for next hand's tribute: both losers on a double-down
+        // (banker's partner also 2nd), otherwise just the last-place seat.
         if partner_place == 1 {
-            // double down — both losers are dwellers
             self.prev_dwellers = self
                 .finish_order
                 .iter()
@@ -725,16 +761,32 @@ fn finish_rank(outs_before: usize) -> FinishRank {
     }
 }
 
-fn take_cards(hand: &mut Vec<Card>, ids: &[u8]) -> Result<Vec<Card>, MatchError> {
-    let mut taken = Vec::with_capacity(ids.len());
+/// Collect cards by id without mutating the hand. Fails if any id is
+/// duplicated or absent.
+fn collect_cards(hand: &[Card], ids: &[u8]) -> Result<Vec<Card>, MatchError> {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    let mut cards = Vec::with_capacity(ids.len());
     for &id in ids {
-        let pos = hand
+        if !seen.insert(id) {
+            return Err(MatchError::CardsNotInHand);
+        }
+        let card = hand
             .iter()
-            .position(|c| c.id == id)
+            .copied()
+            .find(|c| c.id == id)
             .ok_or(MatchError::CardsNotInHand)?;
-        taken.push(hand.remove(pos));
+        cards.push(card);
     }
-    Ok(taken)
+    Ok(cards)
+}
+
+/// Remove cards by id. Call only after `collect_cards` has validated the ids.
+fn remove_cards(hand: &mut Vec<Card>, ids: &[u8]) {
+    for &id in ids {
+        if let Some(pos) = hand.iter().position(|c| c.id == id) {
+            hand.remove(pos);
+        }
+    }
 }
 
 fn peek_tribute_card(hand: &[Card], level: Rank) -> Option<Card> {
@@ -799,5 +851,351 @@ mod tests {
         assert_eq!(team_of(2), TeamId::A);
         assert_eq!(team_of(1), TeamId::B);
         assert_eq!(partner(0), 2);
+    }
+
+    /// A rejected play must never change the hand or the turn.
+    #[test]
+    fn failed_play_keeps_cards() {
+        let mut m = Match::new();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        m.apply(0, Action::Deal, &mut rng).unwrap();
+        let seat = m.current;
+
+        // Duplicate id → error, hand untouched
+        let id = m.players[seat].hand[0].id;
+        let err = m
+            .apply(
+                seat,
+                Action::Play {
+                    card_ids: vec![id, id],
+                },
+                &mut rng,
+            )
+            .unwrap_err();
+        assert_eq!(err, MatchError::CardsNotInHand);
+        assert_eq!(m.players[seat].hand.len(), 27);
+
+        // Bogus id after a valid one → error, valid card NOT removed
+        let err = m
+            .apply(
+                seat,
+                Action::Play {
+                    card_ids: vec![id, 250],
+                },
+                &mut rng,
+            )
+            .unwrap_err();
+        assert_eq!(err, MatchError::CardsNotInHand);
+        assert_eq!(m.players[seat].hand.len(), 27);
+        assert!(m.players[seat].hand.iter().any(|c| c.id == id));
+
+        // Invalid combo (two different ranks) → parse error, cards kept
+        let c1 = m.players[seat].hand[0];
+        let c2 = m.players[seat]
+            .hand
+            .iter()
+            .find(|c| c.rank != c1.rank)
+            .copied()
+            .unwrap();
+        let err = m
+            .apply(
+                seat,
+                Action::Play {
+                    card_ids: vec![c1.id, c2.id],
+                },
+                &mut rng,
+            )
+            .unwrap_err();
+        assert!(matches!(err, MatchError::InvalidHand(_)));
+        assert_eq!(m.players[seat].hand.len(), 27);
+        assert!(m.last_play.is_none());
+        assert_eq!(m.current, seat);
+
+        // CannotBeat → cards returned, still the same turn
+        let joker_seat = (0..4)
+            .find(|&s| m.players[s].hand.iter().any(|c| c.rank == Rank::RedJoker))
+            .unwrap();
+        m.current = joker_seat;
+        let joker = m.players[joker_seat]
+            .hand
+            .iter()
+            .find(|c| c.rank == Rank::RedJoker)
+            .copied()
+            .unwrap();
+        m.apply(
+            joker_seat,
+            Action::Play {
+                card_ids: vec![joker.id],
+            },
+            &mut rng,
+        )
+        .unwrap();
+        let next = m.current;
+        let weak = m.players[next].hand[0]; // sorted low → high
+        let err = m
+            .apply(
+                next,
+                Action::Play {
+                    card_ids: vec![weak.id],
+                },
+                &mut rng,
+            )
+            .unwrap_err();
+        assert_eq!(err, MatchError::CannotBeat);
+        assert_eq!(m.players[next].hand.len(), 27);
+        assert_eq!(m.current, next);
+    }
+
+    /// Tribute (single dweller): Dealt carries the real lead, and Turn events
+    /// drive the returner — without them human clients soft-lock.
+    #[test]
+    fn tribute_emits_turn_events() {
+        let mut m = Match::new();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        m.apply(0, Action::Deal, &mut rng).unwrap();
+        // Simulate hand 1 result: banker 0, single dweller 3
+        m.prev_banker = Some(0);
+        m.prev_dwellers = vec![3];
+        m.phase = MatchPhase::Idle;
+
+        let events = m.apply(0, Action::Deal, &mut rng).unwrap();
+        if matches!(m.phase, MatchPhase::Playing) {
+            // Anti-tribute rolled by this seed — not what this test covers
+            panic!("seed produced anti-tribute");
+        }
+        assert!(matches!(m.phase, MatchPhase::Tribute));
+        let lead = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Dealt { lead, .. } => Some(*lead),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(lead, 3, "single dweller leads after tribute");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Turn { seat: 0, .. })),
+            "returner must be told it is their turn"
+        );
+        assert_eq!(m.current, 0);
+
+        // Return the lowest ≤10 card to the payer
+        let card = m.players[0]
+            .hand
+            .iter()
+            .filter(|c| (c.rank as u8) >= 2 && (c.rank as u8) <= 10)
+            .min_by_key(|c| c.rank as u8)
+            .copied()
+            .expect("banker has a small card");
+        let events = m
+            .apply(
+                0,
+                Action::ReturnTribute {
+                    card_id: card.id,
+                    to_seat: 3,
+                },
+                &mut rng,
+            )
+            .unwrap();
+        assert!(matches!(m.phase, MatchPhase::Playing));
+        assert_eq!(m.current, 3);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Turn {
+                seat: 3,
+                must_lead: true
+            }
+        )));
+    }
+
+    /// Double dweller: both returners get Turn events in order.
+    #[test]
+    fn double_dweller_tribute_turns() {
+        let mut m = Match::new();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(6);
+        m.apply(0, Action::Deal, &mut rng).unwrap();
+        m.prev_banker = Some(0);
+        m.prev_dwellers = vec![1, 3]; // double-down: team B both dwell
+        m.phase = MatchPhase::Idle;
+
+        let events = m.apply(0, Action::Deal, &mut rng).unwrap();
+        if matches!(m.phase, MatchPhase::Playing) {
+            panic!("seed produced anti-tribute");
+        }
+        assert!(matches!(m.phase, MatchPhase::Tribute));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Turn { seat: 0, .. })));
+
+        // Banker returns first, then follower (partner of banker, seat 2)
+        let card0 = m.players[0]
+            .hand
+            .iter()
+            .filter(|c| (c.rank as u8) >= 2 && (c.rank as u8) <= 10)
+            .min_by_key(|c| c.rank as u8)
+            .copied()
+            .unwrap();
+        let events = m
+            .apply(
+                0,
+                Action::ReturnTribute {
+                    card_id: card0.id,
+                    to_seat: 1,
+                },
+                &mut rng,
+            )
+            .unwrap();
+        assert!(matches!(m.phase, MatchPhase::Tribute));
+        assert_eq!(m.current, 2);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Turn { seat: 2, .. })),
+            "second returner must be told"
+        );
+
+        let card2 = m.players[2]
+            .hand
+            .iter()
+            .filter(|c| (c.rank as u8) >= 2 && (c.rank as u8) <= 10)
+            .min_by_key(|c| c.rank as u8)
+            .copied()
+            .unwrap();
+        let events = m
+            .apply(
+                2,
+                Action::ReturnTribute {
+                    card_id: card2.id,
+                    to_seat: 3,
+                },
+                &mut rng,
+            )
+            .unwrap();
+        assert!(matches!(m.phase, MatchPhase::Playing));
+        // Lead = the payer of the higher tribute
+        assert_eq!(m.current, m.lead_seat);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Turn {
+                must_lead: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn anti_tribute_collective_jokers() {
+        let mut m = Match::new();
+        // Single dweller holding both red jokers
+        m.players[3].hand = crate::card::cards_from_codes(&["RJ", "RJ", "S5"]);
+        assert!(m.anti_tribute(&[3]));
+        // Single dweller holding only one
+        m.players[3].hand = crate::card::cards_from_codes(&["RJ", "S5", "C6"]);
+        assert!(!m.anti_tribute(&[3]));
+        // Double dwellers with one red joker each
+        m.players[1].hand = crate::card::cards_from_codes(&["RJ", "S5"]);
+        m.players[3].hand = crate::card::cards_from_codes(&["RJ", "C6"]);
+        assert!(m.anti_tribute(&[1, 3]));
+        // Double dwellers with only one red joker between them
+        m.players[1].hand = crate::card::cards_from_codes(&["RJ", "S5"]);
+        m.players[3].hand = crate::card::cards_from_codes(&["S6", "C6"]);
+        assert!(!m.anti_tribute(&[1, 3]));
+    }
+
+    /// When the trick winner goes out on their play, every remaining active
+    /// player must pass before the trick closes.
+    #[test]
+    fn pass_count_when_leader_went_out() {
+        let mut m = Match::new();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        m.apply(0, Action::Deal, &mut rng).unwrap();
+
+        // Reduce current seat to one card and play it → goes out
+        let a = m.current;
+        let card = m.players[a].hand[0];
+        m.players[a].hand = vec![card];
+        m.apply(
+            a,
+            Action::Play {
+                card_ids: vec![card.id],
+            },
+            &mut rng,
+        )
+        .unwrap();
+        assert!(m.players[a].finished.is_some());
+
+        // Two passes are NOT enough — the third active player must get a turn
+        let b = m.current;
+        m.apply(b, Action::Pass, &mut rng).unwrap();
+        let c = m.current;
+        m.apply(c, Action::Pass, &mut rng).unwrap();
+        assert!(
+            m.last_play.is_some(),
+            "trick closed early; a player was skipped"
+        );
+
+        let d = m.current;
+        m.apply(d, Action::Pass, &mut rng).unwrap();
+        assert!(m.last_play.is_none(), "trick should close after all pass");
+        // Lead passes to the out player's partner (接风)
+        assert_eq!(m.current, partner(a));
+    }
+
+    /// At level A the match is only won when the partner is not the dweller
+    /// of this hand (1st&2nd or 1st&3rd); 1st&4th stays at A.
+    #[test]
+    fn ace_win_condition() {
+        // 1st & 3rd at level A → match won
+        let mut m = Match::new();
+        m.team_levels = [Rank::RA, Rank::R2];
+        m.finish_order = vec![0, 1, 2, 3];
+        let events = m.finish_hand();
+        assert!(matches!(m.phase, MatchPhase::MatchOver));
+        let (over, winner) = events
+            .iter()
+            .find_map(|e| match e {
+                Event::HandResult {
+                    match_over,
+                    winner_team,
+                    ..
+                } => Some((*match_over, *winner_team)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(over);
+        assert_eq!(winner, Some(TeamId::A));
+
+        // 1st & 4th at level A → no win, stay at A
+        let mut m = Match::new();
+        m.team_levels = [Rank::RA, Rank::R2];
+        m.finish_order = vec![0, 1, 3, 2]; // partner seat 2 is dweller
+        let events = m.finish_hand();
+        assert!(matches!(m.phase, MatchPhase::HandOver));
+        assert_eq!(m.team_levels[0], Rank::RA);
+        let over = events
+            .iter()
+            .find_map(|e| match e {
+                Event::HandResult { match_over, .. } => Some(*match_over),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!over);
+
+        // Below A: 1st & 2nd → +3 levels (K → A) but no match win yet
+        let mut m = Match::new();
+        m.team_levels = [Rank::RK, Rank::R2];
+        m.finish_order = vec![0, 2, 1, 3];
+        let events = m.finish_hand();
+        assert!(matches!(m.phase, MatchPhase::HandOver));
+        assert_eq!(m.team_levels[0], Rank::RA);
+        let over = events
+            .iter()
+            .find_map(|e| match e {
+                Event::HandResult { match_over, .. } => Some(*match_over),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!over);
     }
 }

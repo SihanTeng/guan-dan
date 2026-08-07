@@ -13,6 +13,24 @@ use uuid::Uuid;
 
 use crate::settings::GameSettings;
 
+/// Last-resort tribute return: lowest card ranked ≤ 10 (or simply the lowest
+/// card when none qualifies) to the first payer. Always legal under core's
+/// rules, so a tribute phase can never get stuck.
+fn fallback_tribute_action(game: &Match, seat: Seat) -> Option<Action> {
+    let trib = game.tribute.as_ref()?;
+    let hand = &game.players[seat].hand;
+    let card = hand
+        .iter()
+        .filter(|c| (c.rank as u8) >= 2 && (c.rank as u8) <= 10)
+        .min_by_key(|c| c.rank as u8)
+        .or_else(|| hand.iter().min_by_key(|c| c.rank as u8))?;
+    let to_seat = trib.payers.first().copied()?;
+    Some(Action::ReturnTribute {
+        card_id: card.id,
+        to_seat,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct PlayerSlot {
     pub session_id: Option<Uuid>,
@@ -426,6 +444,14 @@ impl Room {
                 tracing::warn!("bot action failed seat={current}: {e}");
                 if phase == MatchPhase::Playing {
                     if let Ok(msgs) = self.apply_action(current, Action::Pass) {
+                        all.extend(msgs);
+                    }
+                } else if let Some(fallback) =
+                    fallback_tribute_action(self.game.as_ref().unwrap(), current)
+                {
+                    // Tribute has no pass equivalent — force a legal return so
+                    // the hand can never wedge.
+                    if let Ok(msgs) = self.apply_action(current, fallback) {
                         all.extend(msgs);
                     }
                 }

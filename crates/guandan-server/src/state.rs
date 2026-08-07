@@ -12,7 +12,10 @@ use uuid::Uuid;
 use crate::room::Room;
 use crate::settings::GameSettings;
 
-pub type OutTx = mpsc::UnboundedSender<String>;
+pub type OutTx = mpsc::Sender<String>;
+
+/// Hard cap on live rooms; guards against room-creation spam.
+const MAX_ROOMS: usize = 1024;
 
 struct Session {
     #[allow(dead_code)]
@@ -62,56 +65,83 @@ impl AppState {
             room
         };
         if let Some(rid) = room_id {
-            let mut rooms = self.rooms.lock().await;
-            if let Some(room) = rooms.get_mut(&rid) {
-                if let Some(seat) = room.seat_of(session_id) {
-                    let vacate = room.vacate_seat(seat, "玩家离开");
-                    let msg = encode_server(&ServerMessage::PlayerLeft { seat }).unwrap();
-                    self.broadcast_room_locked(room, None, msg).await;
-                    // Mid-game: fill with bot immediately so the hand can finish;
-                    // between hands leave vacant for re-party until timeout.
-                    let mid_play = room
-                        .game
-                        .as_ref()
-                        .map(|g| matches!(g.phase, MatchPhase::Playing | MatchPhase::Tribute))
-                        .unwrap_or(false);
-                    if mid_play {
-                        room.slots[seat].is_bot = true;
-                        room.slots[seat].name = format!("机器人{}", seat + 1);
-                        room.slots[seat].ready = true;
-                        let taken = ServerMessage::SeatTaken {
-                            seat,
-                            info: SeatInfo {
-                                seat,
-                                name: room.slots[seat].name.clone(),
-                                is_bot: true,
-                                ready: true,
-                                team: team_of(seat),
-                            },
-                        };
-                        if let Ok(t) = encode_server(&taken) {
-                            self.broadcast_room_locked(room, None, t).await;
-                        }
-                    } else {
-                        for (target, m) in vacate {
-                            if let Ok(t) = encode_server(&m) {
-                                match target {
-                                    Some(sid) => {
-                                        let _ = self.send_to(sid, t).await;
-                                    }
-                                    None => self.broadcast_room_locked(room, None, t).await,
-                                }
-                            }
-                        }
-                    }
-                }
-                if room.player_count() == 0 {
-                    rooms.remove(&rid);
-                }
-            }
+            self.seat_departed(&rid, session_id).await;
         }
         let mut q = self.quick_queue.lock().await;
         q.retain(|id| *id != session_id);
+    }
+
+    /// Vacate `session_id`'s seat in `rid` (left or disconnected): broadcast
+    /// the departure, bot-fill immediately mid-game so the hand can finish,
+    /// and drop the room once no human sessions remain seated.
+    async fn seat_departed(&self, rid: &str, session_id: Uuid) {
+        let mut rooms = self.rooms.lock().await;
+        let Some(room) = rooms.get_mut(rid) else {
+            return;
+        };
+        if let Some(seat) = room.seat_of(session_id) {
+            let vacate = room.vacate_seat(seat, "玩家离开");
+            let msg = encode_server(&ServerMessage::PlayerLeft { seat }).unwrap();
+            self.broadcast_room_locked(room, None, msg).await;
+            // Mid-game: fill with bot immediately so the hand can finish;
+            // between hands leave vacant for re-party until timeout.
+            let mid_play = room
+                .game
+                .as_ref()
+                .map(|g| matches!(g.phase, MatchPhase::Playing | MatchPhase::Tribute))
+                .unwrap_or(false);
+            if mid_play {
+                room.slots[seat].is_bot = true;
+                room.slots[seat].name = format!("机器人{}", seat + 1);
+                room.slots[seat].ready = true;
+                let taken = ServerMessage::SeatTaken {
+                    seat,
+                    info: SeatInfo {
+                        seat,
+                        name: room.slots[seat].name.clone(),
+                        is_bot: true,
+                        ready: true,
+                        team: team_of(seat),
+                    },
+                };
+                if let Ok(t) = encode_server(&taken) {
+                    self.broadcast_room_locked(room, None, t).await;
+                }
+            } else {
+                for (target, m) in vacate {
+                    if let Ok(t) = encode_server(&m) {
+                        match target {
+                            Some(sid) => {
+                                let _ = self.send_to(sid, t).await;
+                            }
+                            None => self.broadcast_room_locked(room, None, t).await,
+                        }
+                    }
+                }
+            }
+        }
+        // A room lives only while at least one human session is seated.
+        let empty = rooms
+            .get(rid)
+            .map(|r| r.slots.iter().all(|s| s.session_id.is_none()))
+            .unwrap_or(false);
+        if empty {
+            rooms.remove(rid);
+        }
+    }
+
+    /// Vacate any seat the session currently holds (before seating it elsewhere).
+    async fn vacate_current_room(&self, session_id: Uuid) {
+        let room_id = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get_mut(&session_id) {
+                Some(s) => s.room_id.take(),
+                None => None,
+            }
+        };
+        if let Some(rid) = room_id {
+            self.seat_departed(&rid, session_id).await;
+        }
     }
 
     pub async fn online_count(&self) -> u32 {
@@ -121,7 +151,8 @@ impl AppState {
     pub async fn send_to(&self, session_id: Uuid, text: String) -> Result<()> {
         let sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get(&session_id) {
-            let _ = s.tx.send(text);
+            // Drop on full queue (slow reader) instead of blocking the server.
+            let _ = s.tx.try_send(text);
         }
         Ok(())
     }
@@ -135,7 +166,7 @@ impl AppState {
                 // need sessions — re-lock carefully
                 let sessions = self.sessions.lock().await;
                 if let Some(s) = sessions.get(&sid) {
-                    let _ = s.tx.send(text.clone());
+                    let _ = s.tx.try_send(text.clone());
                 }
             }
         }
@@ -160,6 +191,11 @@ impl AppState {
                     if let Some(s) = sessions.get_mut(&session_id) {
                         s.name = name;
                     }
+                }
+                // One room per session: leave any previous room first.
+                self.vacate_current_room(session_id).await;
+                if self.rooms.lock().await.len() >= MAX_ROOMS {
+                    bail!("服务器繁忙，请稍后再试");
                 }
                 let rid = format!("R{}", self.room_seq.fetch_add(1, Ordering::SeqCst));
                 let mut room = Room::new(rid.clone(), false, self.settings);
@@ -186,6 +222,15 @@ impl AppState {
                 self.send_to(session_id, t).await?;
             }
             ClientMessage::JoinRoom { room_id } => {
+                {
+                    let sessions = self.sessions.lock().await;
+                    let already = sessions.get(&session_id).and_then(|s| s.room_id.as_deref())
+                        == Some(room_id.as_str());
+                    if already {
+                        bail!("已在该房间");
+                    }
+                }
+                let name = self.name_of(session_id).await;
                 let mut rooms = self.rooms.lock().await;
                 let room = rooms
                     .get_mut(&room_id)
@@ -193,21 +238,9 @@ impl AppState {
                 if room.game.is_some() {
                     bail!("游戏已开始");
                 }
-                let name = {
-                    drop(rooms);
-                    self.name_of(session_id).await
-                };
-                let mut rooms = self.rooms.lock().await;
-                let room = rooms.get_mut(&room_id).unwrap();
                 let seat = room
                     .join(session_id, name)
                     .ok_or_else(|| anyhow::anyhow!("房间已满"))?;
-                {
-                    let mut sessions = self.sessions.lock().await;
-                    if let Some(s) = sessions.get_mut(&session_id) {
-                        s.room_id = Some(room_id.clone());
-                    }
-                }
                 let infos = room.seat_infos();
                 let joined = encode_server(&ServerMessage::RoomJoined {
                     room_id: room_id.clone(),
@@ -219,6 +252,15 @@ impl AppState {
                     info: infos[seat].clone(),
                 })?;
                 self.broadcast_room_locked(room, None, broadcast).await;
+                drop(rooms);
+                // Seat secured — leave any previous room, then record the new one.
+                self.vacate_current_room(session_id).await;
+                {
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(s) = sessions.get_mut(&session_id) {
+                        s.room_id = Some(room_id.clone());
+                    }
+                }
                 // RoomJoined to joiner (broadcast already sent PlayerJoined to all including joiner)
                 let _ = self.send_to(session_id, joined).await;
             }
@@ -226,6 +268,11 @@ impl AppState {
                 self.leave_room(session_id).await?;
             }
             ClientMessage::PracticeMatch => {
+                // One room per session: leave any previous room first.
+                self.vacate_current_room(session_id).await;
+                if self.rooms.lock().await.len() >= MAX_ROOMS {
+                    bail!("服务器繁忙，请稍后再试");
+                }
                 let rid = format!("P{}", self.room_seq.fetch_add(1, Ordering::SeqCst));
                 let mut room = Room::new(rid.clone(), true, self.settings);
                 let name = self.name_of(session_id).await;
@@ -313,6 +360,8 @@ impl AppState {
                 self.take_seat(session_id, seat).await?;
             }
             ClientMessage::Chat { content } => {
+                // Bound chat length — it is re-broadcast to every seat.
+                let content: String = content.chars().take(200).collect();
                 let (room_id, name) = {
                     let sessions = self.sessions.lock().await;
                     let s = sessions
@@ -382,17 +431,7 @@ impl AppState {
             s.room_id.take()
         };
         if let Some(rid) = room_id {
-            let mut rooms = self.rooms.lock().await;
-            if let Some(room) = rooms.get_mut(&rid) {
-                if let Some(seat) = room.seat_of(session_id) {
-                    room.slots[seat].session_id = None;
-                    room.slots[seat].is_bot = false;
-                    room.slots[seat].ready = false;
-                    room.slots[seat].name = format!("空位{}", seat + 1);
-                    let t = encode_server(&ServerMessage::PlayerLeft { seat })?;
-                    self.broadcast_room_locked(room, None, t).await;
-                }
-            }
+            self.seat_departed(&rid, session_id).await;
         }
         Ok(())
     }
@@ -449,9 +488,30 @@ impl AppState {
     }
 
     async fn make_quick_room(&self, players: Vec<Uuid>) -> Result<()> {
+        // Drop players who disconnected or got seated elsewhere while queued —
+        // a stale seat would never act and never be bot-filled.
+        let mut valid = Vec::new();
+        for pid in players {
+            let in_lobby = self
+                .sessions
+                .lock()
+                .await
+                .get(&pid)
+                .map(|s| s.room_id.is_none())
+                .unwrap_or(false);
+            if in_lobby {
+                valid.push(pid);
+            }
+        }
+        if valid.is_empty() {
+            return Ok(());
+        }
+        if self.rooms.lock().await.len() >= MAX_ROOMS {
+            bail!("服务器繁忙，请稍后再试");
+        }
         let rid = format!("Q{}", self.room_seq.fetch_add(1, Ordering::SeqCst));
         let mut room = Room::new(rid.clone(), false, self.settings);
-        for pid in &players {
+        for pid in &valid {
             let name = self.name_of(*pid).await;
             room.join(*pid, name);
             let mut sessions = self.sessions.lock().await;
@@ -469,7 +529,7 @@ impl AppState {
         let infos = room.seat_infos();
         let msgs = room.start_game();
         self.rooms.lock().await.insert(rid.clone(), room);
-        for (i, pid) in players.iter().enumerate() {
+        for (i, pid) in valid.iter().enumerate() {
             let t = encode_server(&ServerMessage::MatchFound {
                 room_id: rid.clone(),
                 seat: i,
@@ -488,26 +548,13 @@ impl AppState {
 
     async fn take_seat(&self, session_id: Uuid, seat: usize) -> Result<()> {
         let name = self.name_of(session_id).await;
-        // Leave previous room seat if any
-        if let Some(old) = self
-            .sessions
-            .lock()
-            .await
-            .get(&session_id)
-            .and_then(|s| s.room_id.clone())
-        {
-            let _ = old;
-        }
-        // Find room from session
+        // Session must already be in the room (JoinRoom first).
         let room_id = self
             .sessions
             .lock()
             .await
             .get(&session_id)
             .and_then(|s| s.room_id.clone());
-        // If not in room, allow join via TakeSeat only when already in that room empty —
-        // Prefer: player in lobby takes seat by joining room first.
-        // Also support: session without room cannot TakeSeat — must JoinRoom then.
         let Some(room_id) = room_id else {
             bail!("请先加入房间再占座");
         };
@@ -538,6 +585,11 @@ impl AppState {
 
     /// Periodic: turn timeouts, bot steps, result confirms, re-party.
     pub async fn tick_game(&self) {
+        // Safety-net GC: rooms only live while a human session is seated.
+        self.rooms
+            .lock()
+            .await
+            .retain(|_, r| r.slots.iter().any(|s| s.session_id.is_some()));
         let room_ids: Vec<String> = self.rooms.lock().await.keys().cloned().collect();
         for rid in room_ids {
             let mut rooms = self.rooms.lock().await;
@@ -558,5 +610,75 @@ impl AppState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use guandan_protocol::decode_server;
+    use std::time::{Duration, Instant};
+
+    /// Full practice match driven end-to-end through AppState with all timers
+    /// fast-forwarded: the hand-2 tribute phase must send TributeReturnTurn
+    /// (the missing message that used to soft-lock human players).
+    #[tokio::test]
+    async fn practice_match_reaches_tribute_and_returns() {
+        let state = AppState::new(GameSettings);
+        let sid = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel::<String>(8192);
+        state.register(sid, Uuid::new_v4(), tx).await;
+        state
+            .handle(sid, ClientMessage::PracticeMatch)
+            .await
+            .unwrap();
+
+        let mut hands_started = 0u32;
+        let mut saw_tribute_paid = false;
+        let mut saw_return_turn = false;
+        let mut saw_tribute_returned = false;
+
+        for _ in 0..20_000 {
+            // Fast-forward: expire every timer so bots act, timeouts fire,
+            // and confirms complete immediately.
+            {
+                let mut rooms = state.rooms.lock().await;
+                let past = Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now);
+                for room in rooms.values_mut() {
+                    room.reveal_until = None;
+                    if room.turn_deadline.is_some() {
+                        room.turn_deadline = Some(past);
+                    }
+                    if room.confirm_deadline.is_some() {
+                        room.confirm_deadline = Some(past);
+                    }
+                }
+            }
+            state.tick_game().await;
+            while let Ok(text) = rx.try_recv() {
+                let Ok(sm) = decode_server(&text) else {
+                    continue;
+                };
+                match sm {
+                    ServerMessage::GameStart { hand_number, .. } => {
+                        hands_started = hands_started.max(hand_number);
+                    }
+                    ServerMessage::TributePaid { .. } => saw_tribute_paid = true,
+                    ServerMessage::TributeReturnTurn { .. } => saw_return_turn = true,
+                    ServerMessage::TributeReturned { .. } => saw_tribute_returned = true,
+                    _ => {}
+                }
+            }
+            if hands_started >= 2 && saw_tribute_paid && saw_return_turn && saw_tribute_returned {
+                break;
+            }
+        }
+
+        assert!(hands_started >= 2, "second hand never dealt");
+        assert!(saw_tribute_paid, "tribute never paid in hand 2");
+        assert!(saw_return_turn, "no TributeReturnTurn message sent");
+        assert!(saw_tribute_returned, "tribute return never completed");
     }
 }

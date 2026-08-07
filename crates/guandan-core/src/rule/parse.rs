@@ -173,8 +173,8 @@ fn try_straight_flush(cards: &[Card], level: Rank) -> Option<ParsedHand> {
         s
     };
 
-    // Try all straight shapes; wilds fill missing ranks
-    for shape in straight_shapes() {
+    // Try all straight shapes, strongest first; wilds fill missing ranks.
+    for shape in straight_shapes().into_iter().rev() {
         if straight_shape_fits(&fixed, wilds.len(), &shape) {
             let key = shape_high_rank(&shape);
             return Some(make(HandType::StraightFlush, key, 5, cards));
@@ -279,9 +279,10 @@ fn try_full_house(cards: &[Card], level: Rank) -> Option<ParsedHand> {
             return None;
         }
     }
-    // Enumerate which rank is the triple (key) and which is the pair
-    for &triple_rank in face_ranks() {
-        for &pair_rank in face_ranks() {
+    // Enumerate which rank is the triple (key) and which is the pair;
+    // strongest triple first so wild hands get their best interpretation.
+    for &triple_rank in face_ranks().iter().rev() {
+        for &pair_rank in face_ranks().iter().rev() {
             if triple_rank == pair_rank {
                 continue;
             }
@@ -305,8 +306,9 @@ fn try_straight(cards: &[Card], level: Rank) -> Option<ParsedHand> {
     }
     let (fixed, wilds) = split_wilds(cards, level);
     // In straights, wilds are free; non-wild level cards count as their natural face.
-    for shape in straight_shapes() {
-        if straight_shape_fits_natural(&fixed, wilds.len(), &shape) {
+    // Strongest shape first so wild hands get their best interpretation.
+    for shape in straight_shapes().into_iter().rev() {
+        if straight_shape_fits(&fixed, wilds.len(), &shape) {
             let key = shape_high_rank(&shape);
             return Some(make(HandType::Straight, key, 5, cards));
         }
@@ -401,8 +403,8 @@ fn can_form_counts(cards: &[Card], level: Rank, need: &[(Rank, usize)]) -> bool 
     wild_left == 0
 }
 
-/// Straight shapes as lists of 5 face ranks (A can be low).
-fn straight_shapes() -> Vec<Vec<Rank>> {
+/// Straight shapes as lists of 5 face ranks (A can be low), ascending by strength.
+pub(crate) fn straight_shapes() -> Vec<Vec<Rank>> {
     let mut shapes = Vec::new();
     // A-2-3-4-5
     shapes.push(vec![Rank::RA, Rank::R2, Rank::R3, Rank::R4, Rank::R5]);
@@ -447,14 +449,15 @@ fn straight_shape_fits(fixed: &[Card], wild_n: usize, shape: &[Rank]) -> bool {
     missing == wild_n
 }
 
-/// Like straight_shape_fits but level cards use natural rank (already on card.rank).
-fn straight_shape_fits_natural(fixed: &[Card], wild_n: usize, shape: &[Rank]) -> bool {
-    straight_shape_fits(fixed, wild_n, shape)
-}
-
 /// Compare key ranks under level for same hand type.
 pub fn key_beats(new_key: Rank, old_key: Rank, level: Rank) -> bool {
     play_strength(new_key, level) > play_strength(old_key, level)
+}
+
+/// Compare key ranks by natural face order. Used for straights and straight
+/// flushes, where the level card participates at its natural value.
+pub fn key_beats_natural(new_key: Rank, old_key: Rank) -> bool {
+    (new_key as u8) > (old_key as u8)
 }
 
 #[cfg(test)]
@@ -581,5 +584,24 @@ mod tests {
         let cards = cards_from_codes(&["S3", "S4", "S5", "S6", "S7"]);
         let h = parse_hand(&cards, Rank::RA).unwrap();
         assert_eq!(h.ty, HandType::StraightFlush);
+    }
+
+    #[test]
+    fn wild_straight_picks_strongest() {
+        // level 2 wild + 4-5-6-7 (mixed suits) → strongest interpretation
+        // 4-5-6-7-8 (key 8)
+        let cards = cards_from_codes(&["H2", "S4", "H5", "S6", "C7"]);
+        let h = parse_hand(&cards, Rank::R2).unwrap();
+        assert_eq!(h.ty, HandType::Straight);
+        assert_eq!(h.key, Rank::R8);
+    }
+
+    #[test]
+    fn wild_full_house_picks_strongest() {
+        // level 2 wild + 5-5-6-6 → 6s full of 5s, not the weaker 5s full
+        let cards = cards_from_codes(&["S5", "C5", "S6", "C6", "H2"]);
+        let h = parse_hand(&cards, Rank::R2).unwrap();
+        assert_eq!(h.ty, HandType::FullHouse);
+        assert_eq!(h.key, Rank::R6);
     }
 }

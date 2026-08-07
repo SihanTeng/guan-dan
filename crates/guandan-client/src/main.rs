@@ -15,8 +15,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
 use std::time::Duration;
+use tokio::sync::mpsc::error::TryRecvError;
 
-use app::{App, Screen};
+use app::App;
 use net::NetHandle;
 
 #[derive(Parser, Debug)]
@@ -30,6 +31,15 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Restore the terminal on panic — otherwise the shell is left stuck in
+    // raw mode / alternate screen.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        default_hook(info);
+    }));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -53,8 +63,15 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, server: &str
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        while let Ok(msg) = incoming.try_recv() {
-            app.on_server(msg);
+        loop {
+            match incoming.try_recv() {
+                Ok(msg) => app.on_server(msg),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.on_disconnect();
+                    break;
+                }
+            }
         }
 
         if event::poll(Duration::from_millis(50))? {
@@ -78,6 +95,5 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, server: &str
         app.tick();
     }
 
-    let _ = Screen::Lobby;
     Ok(())
 }

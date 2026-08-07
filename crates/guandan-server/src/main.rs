@@ -22,6 +22,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Max queued outbound messages per connection; slow readers beyond this are
+/// dropped instead of buffering forever.
+const OUTBOUND_QUEUE: usize = 512;
+
 #[derive(Parser, Debug)]
 #[command(name = "guandan-server", about = "掼蛋 WebSocket 服务器")]
 struct Args {
@@ -73,7 +77,10 @@ async fn handle_connection(
 ) -> Result<()> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut sink, mut stream) = ws.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    // Bounded outbound queue: a client that stops reading must not be able to
+    // grow server memory without limit. When the queue is full, messages to
+    // that client are dropped (see send_to).
+    let (tx, mut rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
 
     let session_id = Uuid::new_v4();
     let player_id = Uuid::new_v4();
@@ -86,7 +93,7 @@ async fn handle_connection(
     sink.send(Message::Text(hello.into())).await?;
 
     let online = state.online_count().await;
-    let _ = tx.send(encode_server(&ServerMessage::OnlineCount {
+    let _ = tx.try_send(encode_server(&ServerMessage::OnlineCount {
         count: online,
     })?);
 

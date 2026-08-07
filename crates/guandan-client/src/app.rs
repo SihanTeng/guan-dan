@@ -23,6 +23,14 @@ pub enum Screen {
     MatchOver,
 }
 
+/// A seat's latest action in the current trick (for the table view).
+#[derive(Debug, Clone)]
+pub struct TrickEntry {
+    pub cards: Vec<Card>,
+    pub hand_type: Option<HandType>,
+    pub pass: bool,
+}
+
 pub struct App {
     pub net: NetHandle,
     pub screen: Screen,
@@ -67,6 +75,8 @@ pub struct App {
     pub my_result_confirmed: bool,
     pub can_follow: bool,
     pub no_legal_play: bool,
+    /// Latest action of each seat in the current trick, by seat.
+    pub trick: [Option<TrickEntry>; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +129,7 @@ impl App {
             my_result_confirmed: false,
             can_follow: true,
             no_legal_play: false,
+            trick: Default::default(),
         }
     }
 
@@ -135,6 +146,17 @@ impl App {
                 self.reveal_seat = None;
             }
         }
+        // A fresh lead with no reveal holding means the previous trick is
+        // over — clear the table.
+        if !self.revealing() && self.must_lead {
+            self.trick = Default::default();
+        }
+    }
+
+    /// Called when the server connection drops: tell the user, persistently.
+    pub fn on_disconnect(&mut self) {
+        self.status = "⚠ 与服务器断开连接 · Disconnected — Ctrl+C 退出".into();
+        self.status_ticks = u32::MAX;
     }
 
     /// Seconds left on the turn timer (None if not in a timed turn).
@@ -239,6 +261,7 @@ impl App {
                 self.current = Some(lead);
                 self.must_lead = true;
                 self.last_play = None;
+                self.trick = Default::default();
                 self.turn_deadline = None;
                 self.reveal_until = None;
                 self.reveal_seat = None;
@@ -289,7 +312,9 @@ impl App {
                 self.must_lead = must_lead;
                 self.can_follow = can_follow;
                 self.no_legal_play = seat == self.my_seat && !must_lead && !can_follow;
-                if !self.revealing() && last_play.is_some() {
+                // A fresh lead carries last_play: None — always apply it so the
+                // previous trick's winning play doesn't linger on the table.
+                if last_play.is_some() || must_lead {
                     self.last_play = last_play;
                 }
                 self.start_turn_timer();
@@ -323,6 +348,11 @@ impl App {
                     hand_type,
                     key: cards.first().map(|c| c.rank).unwrap_or(Rank::R2),
                 });
+                self.trick[seat] = Some(TrickEntry {
+                    cards: cards.clone(),
+                    hand_type: Some(hand_type),
+                    pass: false,
+                });
                 if seat == self.my_seat {
                     let ids: std::collections::HashSet<_> = cards.iter().map(|c| c.id).collect();
                     self.hand.retain(|c| !ids.contains(&c.id));
@@ -343,6 +373,11 @@ impl App {
                 seat,
                 reveal_secs: _,
             } => {
+                self.trick[seat] = Some(TrickEntry {
+                    cards: Vec::new(),
+                    hand_type: None,
+                    pass: true,
+                });
                 if seat == self.my_seat {
                     self.set_status("不出 · Pass");
                     self.clear_play_input();
@@ -489,6 +524,16 @@ impl App {
 
     fn on_lobby_key(&mut self, code: KeyCode) -> bool {
         match code {
+            // Typing goes to the Join field first (room ids are uppercase).
+            KeyCode::Char(c)
+                if self.lobby_focus == LobbyFocus::Join
+                    && (c.is_ascii_alphanumeric() || c == '-') =>
+            {
+                self.input_buf.push(c.to_ascii_uppercase());
+            }
+            KeyCode::Backspace if self.lobby_focus == LobbyFocus::Join => {
+                self.input_buf.pop();
+            }
             KeyCode::Esc | KeyCode::Char('q') => return true,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.lobby_focus = match self.lobby_focus {
@@ -507,14 +552,6 @@ impl App {
                     LobbyFocus::Join => LobbyFocus::Help,
                     LobbyFocus::Help => LobbyFocus::Practice,
                 };
-            }
-            KeyCode::Char(c) if self.lobby_focus == LobbyFocus::Join => {
-                if c.is_ascii_alphanumeric() || c == '-' {
-                    self.input_buf.push(c);
-                }
-            }
-            KeyCode::Backspace if self.lobby_focus == LobbyFocus::Join => {
-                self.input_buf.pop();
             }
             KeyCode::Enter => match self.lobby_focus {
                 LobbyFocus::Practice => {
@@ -638,8 +675,11 @@ impl App {
     /// Append a rank key into the typed play buffer and highlight matching cards.
     fn type_rank_char(&mut self, ch: char) {
         let upper = ch.to_ascii_uppercase();
-        // Allow rank keys + '0' for 10
-        if Rank::from_key_char(upper).is_none() && upper != '0' {
+        // Allow rank keys + '0' for 10; '1' only as the first half of "10".
+        let valid = Rank::from_key_char(upper).is_some()
+            || upper == '0'
+            || upper == '1' && self.play_buf.is_empty();
+        if !valid {
             return;
         }
         // Cap buffer length (hand is 27)
@@ -716,18 +756,6 @@ impl App {
 
         // Prefer typed buffer (ddz-style), else visual selection
         let ids: Vec<u8> = if !self.play_buf.is_empty() {
-            // Allow PASS typed in buffer
-            let upper = self.play_buf.to_ascii_uppercase();
-            if upper == "P" || upper == "PASS" {
-                if !self.must_lead && !self.tribute_mode {
-                    self.net.send(ClientMessage::Pass);
-                    self.clear_play_input();
-                    self.set_status("不出 · Pass");
-                } else {
-                    self.set_status("必须出牌 · Must play");
-                }
-                return;
-            }
             match find_cards_in_hand(&self.hand, &self.play_buf) {
                 Ok(cards) => cards.iter().map(|c| c.id).collect(),
                 Err(e) => {
@@ -776,4 +804,55 @@ impl App {
 
 pub fn hand_type_cn(t: HandType) -> &'static str {
     t.chinese_name()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::NetHandle;
+
+    /// A fresh-lead PlayTurn must clear the previous trick's winning play.
+    #[test]
+    fn play_turn_fresh_lead_clears_last_play() {
+        let mut app = App::new(NetHandle::dummy());
+        app.last_play = Some(PublicPlay {
+            seat: 1,
+            cards: Vec::new(),
+            hand_type: HandType::Single,
+            key: Rank::R3,
+        });
+        app.on_server(ServerMessage::PlayTurn {
+            seat: 0,
+            must_lead: true,
+            last_play: None,
+            timeout_secs: 30,
+            can_follow: true,
+        });
+        assert!(app.last_play.is_none());
+    }
+
+    /// Trick entries track plays/passes and clear on the next fresh lead.
+    #[test]
+    fn trick_entries_lifecycle() {
+        let mut app = App::new(NetHandle::dummy());
+        let cards = guandan_core::card::cards_from_codes(&["S5", "H5"]);
+        app.on_server(ServerMessage::CardPlayed {
+            seat: 2,
+            cards: cards.clone(),
+            hand_type: HandType::Pair,
+            counts: [27, 25, 27, 27],
+            reveal_secs: 3,
+        });
+        assert!(app.trick[2].as_ref().is_some_and(|e| !e.pass));
+        app.on_server(ServerMessage::PlayerPass {
+            seat: 3,
+            reveal_secs: 3,
+        });
+        assert!(app.trick[3].as_ref().is_some_and(|e| e.pass));
+        // Next trick starts (must_lead) and the reveal is over → table clears
+        app.must_lead = true;
+        app.reveal_until = None;
+        app.tick();
+        assert!(app.trick.iter().all(|e| e.is_none()));
+    }
 }

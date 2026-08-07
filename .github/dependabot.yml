@@ -1,9 +1,11 @@
-# Dependabot — keep Rust crates and Actions up to date.
+# Dependabot config (not a CI workflow).
+# Opens version-bump PRs on a schedule; existing `.github/workflows/ci.yml`
+# validates them like any other PR. See:
 # https://docs.github.com/en/code-security/dependabot
 
 version: 2
 updates:
-  # Cargo workspace (root Cargo.toml + lockfile)
+  # ── Cargo workspace (root Cargo.toml + lockfile) ─────────────────
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -11,20 +13,27 @@ updates:
       day: "monday"
       time: "09:00"
       timezone: "Asia/Shanghai"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
     labels:
       - "dependencies"
       - "rust"
-    # Group minor/patch bumps to avoid PR spam; majors stay separate.
+    # Majors often break APIs (e.g. rand 0.9 → 0.10). Only propose
+    # minor/patch; upgrade majors intentionally in a dedicated PR.
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+    # One PR for all safe bumps instead of a flood of singles.
     groups:
-      cargo-minor:
+      cargo-minor-patch:
+        applies-to: version-updates
         update-types:
           - "minor"
           - "patch"
 
-  # GitHub Actions used by ci.yml / release.yml
+  # ── Actions used by ci.yml / release.yml ─────────────────────────
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -38,3 +47,8 @@ updates:
     labels:
       - "dependencies"
       - "github-actions"
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"

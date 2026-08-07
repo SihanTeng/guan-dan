@@ -23,6 +23,8 @@ pub struct CardFace {
     pub level: Rank,
     pub selected: bool,
     pub cursor: bool,
+    /// Soft pointer highlight (does not imply keyboard cursor).
+    pub hover: bool,
 }
 
 impl CardFace {
@@ -101,10 +103,14 @@ fn render_normal(face: CardFace, area: Rect, buf: &mut Buffer) {
     if area.width < 4 || area.height < 3 {
         return;
     }
-    let bg = if face.selected { PAPER_SEL } else { PAPER };
+    let bg = if face.selected || (face.hover && !face.selected) {
+        PAPER_SEL
+    } else {
+        PAPER
+    };
     let border = if face.cursor {
         theme::BORDER_FOCUS
-    } else if face.selected {
+    } else if face.selected || face.hover {
         theme::ACCENT
     } else if face.is_wild() {
         WILD
@@ -202,7 +208,7 @@ fn render_joker(face: CardFace, area: Rect, buf: &mut Buffer) {
     }
 
     let is_big = face.is_big_joker();
-    let bg = if face.selected {
+    let bg = if face.selected || face.hover {
         if is_big {
             Color::Rgb(255, 236, 236)
         } else {
@@ -215,7 +221,7 @@ fn render_joker(face: CardFace, area: Rect, buf: &mut Buffer) {
     };
     let border = if face.cursor {
         theme::BORDER_FOCUS
-    } else if face.selected {
+    } else if face.selected || face.hover {
         theme::ACCENT
     } else if is_big {
         INK_RED
@@ -267,15 +273,12 @@ fn render_joker(face: CardFace, area: Rect, buf: &mut Buffer) {
     row_chars(buf, x, y + 3, &format!("{b0}{b1}{b2}{b3}{b4}"), &[st_b; 5]);
 }
 
-pub fn render_card_row(
-    buf: &mut Buffer,
-    area: Rect,
-    cards: &[(Card, bool, bool)],
-    level: Rank,
-    gap: u16,
-) {
+/// `(card, selected, cursor, hover)`
+pub type CardFlags = (Card, bool, bool, bool);
+
+pub fn render_card_row(buf: &mut Buffer, area: Rect, cards: &[CardFlags], level: Rank, gap: u16) {
     let mut x = area.x;
-    for &(card, selected, cursor) in cards {
+    for &(card, selected, cursor, hover) in cards {
         if x + CARD_W > area.x + area.width {
             break;
         }
@@ -284,19 +287,14 @@ pub fn render_card_row(
             level,
             selected,
             cursor,
+            hover,
         }
         .render(Rect::new(x, area.y, CARD_W, CARD_H.min(area.height)), buf);
         x = x.saturating_add(CARD_W + gap);
     }
 }
 
-pub fn render_card_grid(
-    buf: &mut Buffer,
-    area: Rect,
-    cards: &[(Card, bool, bool)],
-    level: Rank,
-    gap: u16,
-) {
+pub fn render_card_grid(buf: &mut Buffer, area: Rect, cards: &[CardFlags], level: Rank, gap: u16) {
     if area.height < CARD_H || area.width < CARD_W {
         return;
     }
@@ -335,6 +333,7 @@ pub fn card_strip_lines(cards: &[Card], level: Rank) -> Vec<Line<'static>> {
             level,
             selected: false,
             cursor: false,
+            hover: false,
         };
         spans.push(Span::styled(
             format!("{} ", face.strip_label()),

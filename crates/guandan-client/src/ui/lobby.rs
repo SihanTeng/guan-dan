@@ -71,8 +71,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines = Vec::new();
     for (focus, label) in items {
-        let on = app.lobby_focus == focus;
-        if on {
+        let focused = app.lobby_focus == focus;
+        let hovered = app.hover_lobby == Some(focus);
+        if focused {
             lines.push(Line::from(vec![
                 Span::styled("  › ", Style::default().fg(ACCENT).bg(SURFACE)),
                 Span::styled(
@@ -83,6 +84,12 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
+        } else if hovered {
+            // Soft hover (Grok-style) without stealing keyboard focus chrome.
+            lines.push(Line::from(vec![
+                Span::styled("  · ", Style::default().fg(ACCENT).bg(SURFACE)),
+                Span::styled(format!("{label}  "), Style::default().fg(TEXT).bg(SURFACE)),
+            ]));
         } else {
             lines.push(Line::from(Span::styled(
                 format!("    {label}"),
@@ -92,7 +99,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  ↑↓  选择    Enter  确认    q  退出",
+        "  ↑↓ / 单击  选择    Enter / 单击  确认    滚轮  移动    q  退出",
         Style::default().fg(MUTED).bg(BG),
     )));
 
@@ -171,7 +178,7 @@ pub fn draw_room(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  R  准备      Esc  离开",
+        "  R / 单击  准备      Esc / 点外侧  离开",
         Style::default().fg(MUTED).bg(SURFACE),
     )));
 

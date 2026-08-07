@@ -5,6 +5,7 @@
 
 mod cards;
 mod game;
+pub mod hit;
 mod lobby;
 mod theme;
 
@@ -58,6 +59,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
   键入点数  34567  KK  3334  BR
   Enter 出  P 过  ⌫ 删  Esc 清空
   ←→ Space 点选
+  鼠标：单击选牌 · 双击出牌 · 右键过
+  滚轮移光标 · 点牌桌/输入行出牌
+  点「记牌」或记牌器开关
 
 记牌器
   C  开/关（本局剩余牌张，不含自己手牌）
@@ -70,6 +74,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
   每回合 30 秒 · 他人出牌展示 3 秒
   本局结束：确认名次 10 秒，超时自动确认
   机器人立刻确认；中途离开由机器人顶上
+
+大厅 / 房间
+  单击菜单项即确认 · 房间内点面板准备
+  帮助 / 结果弹层：单击关闭或确认
 
 H / Esc  关闭";
     draw_popup(f, area, "帮助", text);

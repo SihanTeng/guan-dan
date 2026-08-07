@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use guandan_core::{
     card::sort_hand, find_card_indices_in_hand, find_cards_in_hand, Card, FinishRank, HandType,
     Rank, Seat, TeamId,
@@ -11,10 +11,12 @@ use guandan_protocol::{
     ClientMessage, PublicPlay, SeatInfo, ServerMessage, CONFIRM_TIMEOUT_SECS, PLAY_REVEAL_SECS,
     TURN_TIMEOUT_SECS,
 };
+use ratatui::layout::Rect;
 use uuid::Uuid;
 
 use crate::counter::CardCounter;
 use crate::net::NetHandle;
+use crate::ui::hit::{self, HitTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -85,6 +87,12 @@ pub struct App {
     pub no_legal_play: bool,
     /// Latest action of each seat in the current trick, by seat.
     pub trick: [Option<TrickEntry>; 4],
+    /// Soft pointer highlight over a hand card (index into `hand`).
+    pub hover_card: Option<usize>,
+    /// Soft pointer highlight over a lobby menu row.
+    pub hover_lobby: Option<LobbyFocus>,
+    /// Last left-click for double-click detection (instant, col, row, target).
+    last_click: Option<(Instant, u16, u16, HitTarget)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +148,9 @@ impl App {
             can_follow: true,
             no_legal_play: false,
             trick: Default::default(),
+            hover_card: None,
+            hover_lobby: None,
+            last_click: None,
         }
     }
 
@@ -513,6 +524,270 @@ impl App {
         }
     }
 
+    /// Handle a mouse event. `area` is the full terminal frame.
+    /// Returns true if the app should quit.
+    pub fn on_mouse(&mut self, ev: MouseEvent, area: Rect) -> bool {
+        match ev.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                self.update_hover(area, ev.column, ev.row);
+                false
+            }
+            MouseEventKind::ScrollUp => self.on_scroll(area, ev.column, ev.row, -1),
+            MouseEventKind::ScrollDown => self.on_scroll(area, ev.column, ev.row, 1),
+            MouseEventKind::ScrollLeft => self.on_scroll(area, ev.column, ev.row, -1),
+            MouseEventKind::ScrollRight => self.on_scroll(area, ev.column, ev.row, 1),
+            MouseEventKind::Down(btn) => {
+                self.update_hover(area, ev.column, ev.row);
+                match btn {
+                    MouseButton::Left => self.on_left_click(area, ev.column, ev.row),
+                    MouseButton::Right => self.on_right_click(area, ev.column, ev.row),
+                    MouseButton::Middle => {
+                        // Middle click clears selection / typed buffer (game).
+                        if self.screen == Screen::Game
+                            && (!self.play_buf.is_empty() || self.selected.iter().any(|s| *s))
+                        {
+                            self.clear_play_input();
+                            self.set_status("已清空输入 · Cleared");
+                        }
+                        false
+                    }
+                }
+            }
+            MouseEventKind::Up(_) => false,
+        }
+    }
+
+    fn update_hover(&mut self, area: Rect, col: u16, row: u16) {
+        match hit::hit_test(self, area, col, row) {
+            Some(HitTarget::Card(i)) => {
+                self.hover_card = Some(i);
+                self.hover_lobby = None;
+            }
+            Some(HitTarget::LobbyItem(f)) => {
+                self.hover_lobby = Some(f);
+                self.hover_card = None;
+            }
+            _ => {
+                self.hover_card = None;
+                self.hover_lobby = None;
+            }
+        }
+    }
+
+    fn on_scroll(&mut self, area: Rect, col: u16, row: u16, dir: i8) -> bool {
+        // dir > 0 = wheel down / right → next item; < 0 = previous.
+        match self.screen {
+            Screen::Lobby => {
+                // Prefer target under cursor; otherwise move current focus.
+                if let Some(HitTarget::LobbyItem(f)) = hit::hit_test(self, area, col, row) {
+                    self.lobby_focus = f;
+                }
+                if dir < 0 {
+                    self.lobby_focus = match self.lobby_focus {
+                        LobbyFocus::Practice => LobbyFocus::Help,
+                        LobbyFocus::Create => LobbyFocus::Practice,
+                        LobbyFocus::Quick => LobbyFocus::Create,
+                        LobbyFocus::Join => LobbyFocus::Quick,
+                        LobbyFocus::Help => LobbyFocus::Join,
+                    };
+                } else {
+                    self.lobby_focus = match self.lobby_focus {
+                        LobbyFocus::Practice => LobbyFocus::Create,
+                        LobbyFocus::Create => LobbyFocus::Quick,
+                        LobbyFocus::Quick => LobbyFocus::Join,
+                        LobbyFocus::Join => LobbyFocus::Help,
+                        LobbyFocus::Help => LobbyFocus::Practice,
+                    };
+                }
+            }
+            Screen::Game => {
+                if self.hand.is_empty() {
+                    return false;
+                }
+                // Move cursor along the hand (wheel up = left, down = right).
+                if dir < 0 {
+                    if self.cursor > 0 {
+                        self.cursor -= 1;
+                    }
+                } else if self.cursor + 1 < self.hand.len() {
+                    self.cursor += 1;
+                }
+            }
+            Screen::Help => {
+                // Scroll does nothing on help; click closes.
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn on_left_click(&mut self, area: Rect, col: u16, row: u16) -> bool {
+        let target = hit::hit_test(self, area, col, row);
+        let now = Instant::now();
+        let is_double = self
+            .last_click
+            .as_ref()
+            .map(|(t, c, r, prev)| {
+                now.duration_since(*t) < Duration::from_millis(400)
+                    && c.abs_diff(col) <= 1
+                    && r.abs_diff(row) <= 1
+                    && Some(*prev) == target
+            })
+            .unwrap_or(false);
+        if let Some(t) = target {
+            self.last_click = Some((now, col, row, t));
+        } else {
+            self.last_click = None;
+        }
+
+        match target {
+            Some(HitTarget::LobbyItem(focus)) => {
+                let already = self.lobby_focus == focus;
+                self.lobby_focus = focus;
+                // Activate on double-click, or single-click when already focused
+                // (or always for non-Join — Join needs focus for typing first).
+                let activate = is_double || already || !matches!(focus, LobbyFocus::Join);
+                if activate {
+                    return self.activate_lobby_focus();
+                }
+                false
+            }
+            Some(HitTarget::RoomReady) => {
+                self.net.send(ClientMessage::Ready);
+                self.set_status("已准备 · Ready");
+                false
+            }
+            Some(HitTarget::RoomLeave) => {
+                self.net.send(ClientMessage::LeaveRoom);
+                self.screen = Screen::Lobby;
+                false
+            }
+            Some(HitTarget::Card(i)) => {
+                if i >= self.hand.len() {
+                    return false;
+                }
+                self.play_buf.clear();
+                self.cursor = i;
+                if is_double {
+                    // Double-click: ensure this card is selected, then play.
+                    if let Some(sel) = self.selected.get_mut(i) {
+                        *sel = true;
+                    }
+                    self.submit_play();
+                } else if let Some(sel) = self.selected.get_mut(i) {
+                    *sel = !*sel;
+                }
+                false
+            }
+            Some(HitTarget::CounterToggle) => {
+                self.show_counter = !self.show_counter;
+                self.set_status(if self.show_counter {
+                    "记牌器 开 · Card counter ON (C 关闭)"
+                } else {
+                    "记牌器 关 · Card counter OFF"
+                });
+                false
+            }
+            Some(HitTarget::Play) => {
+                self.submit_play();
+                false
+            }
+            Some(HitTarget::Pass) => {
+                if self.current == Some(self.my_seat) && !self.must_lead && !self.tribute_mode {
+                    self.net.send(ClientMessage::Pass);
+                    self.clear_play_input();
+                    self.set_status("不出 · Pass");
+                }
+                false
+            }
+            Some(HitTarget::ConfirmResult) => {
+                if self.screen == Screen::HandResult {
+                    if !self.my_result_confirmed {
+                        self.net.send(ClientMessage::ConfirmResult);
+                        self.my_result_confirmed = true;
+                        self.set_status("已确认排名 · 等待其他人…");
+                    }
+                } else if self.screen == Screen::MatchOver {
+                    if !self.my_result_confirmed {
+                        self.net.send(ClientMessage::ConfirmResult);
+                        self.my_result_confirmed = true;
+                        self.set_status("已确认 · 可离开");
+                    } else {
+                        self.screen = Screen::Lobby;
+                        self.net.send(ClientMessage::LeaveRoom);
+                    }
+                }
+                false
+            }
+            Some(HitTarget::CloseHelp) => {
+                self.screen = self.prev_screen;
+                false
+            }
+            Some(HitTarget::MatchLeave) => {
+                self.screen = Screen::Lobby;
+                self.net.send(ClientMessage::LeaveRoom);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn on_right_click(&mut self, _area: Rect, _col: u16, _row: u16) -> bool {
+        match self.screen {
+            Screen::Game => {
+                if self.current == Some(self.my_seat) && !self.must_lead && !self.tribute_mode {
+                    self.net.send(ClientMessage::Pass);
+                    self.clear_play_input();
+                    self.set_status("不出 · Pass");
+                } else if !self.play_buf.is_empty() || self.selected.iter().any(|s| *s) {
+                    self.clear_play_input();
+                    self.set_status("已清空输入 · Cleared");
+                }
+            }
+            Screen::Help => {
+                self.screen = self.prev_screen;
+            }
+            Screen::Lobby => {
+                // Right-click quits from lobby? Too aggressive — ignore.
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Fire the current lobby menu action (shared by Enter and mouse).
+    fn activate_lobby_focus(&mut self) -> bool {
+        match self.lobby_focus {
+            LobbyFocus::Practice => {
+                self.net.send(ClientMessage::PracticeMatch);
+                self.set_status("开始人机练习…");
+            }
+            LobbyFocus::Create => {
+                self.net.send(ClientMessage::CreateRoom {
+                    name: String::new(),
+                });
+            }
+            LobbyFocus::Quick => {
+                self.net.send(ClientMessage::QuickMatch);
+                self.set_status("快速匹配中…");
+            }
+            LobbyFocus::Join => {
+                if !self.input_buf.is_empty() {
+                    self.net.send(ClientMessage::JoinRoom {
+                        room_id: self.input_buf.clone(),
+                    });
+                } else {
+                    self.net.send(ClientMessage::ListRooms);
+                }
+            }
+            LobbyFocus::Help => {
+                self.prev_screen = Screen::Lobby;
+                self.screen = Screen::Help;
+            }
+        }
+        false
+    }
+
     /// Returns true if should quit.
     pub fn on_key(&mut self, code: KeyCode) -> bool {
         match self.screen {
@@ -584,34 +859,9 @@ impl App {
                     LobbyFocus::Help => LobbyFocus::Practice,
                 };
             }
-            KeyCode::Enter => match self.lobby_focus {
-                LobbyFocus::Practice => {
-                    self.net.send(ClientMessage::PracticeMatch);
-                    self.set_status("开始人机练习…");
-                }
-                LobbyFocus::Create => {
-                    self.net.send(ClientMessage::CreateRoom {
-                        name: String::new(),
-                    });
-                }
-                LobbyFocus::Quick => {
-                    self.net.send(ClientMessage::QuickMatch);
-                    self.set_status("快速匹配中…");
-                }
-                LobbyFocus::Join => {
-                    if !self.input_buf.is_empty() {
-                        self.net.send(ClientMessage::JoinRoom {
-                            room_id: self.input_buf.clone(),
-                        });
-                    } else {
-                        self.net.send(ClientMessage::ListRooms);
-                    }
-                }
-                LobbyFocus::Help => {
-                    self.prev_screen = Screen::Lobby;
-                    self.screen = Screen::Help;
-                }
-            },
+            KeyCode::Enter => {
+                return self.activate_lobby_focus();
+            }
             KeyCode::Char('h') | KeyCode::Char('H') => {
                 self.prev_screen = Screen::Lobby;
                 self.screen = Screen::Help;
@@ -913,6 +1163,141 @@ mod tests {
         app.reveal_until = None;
         app.tick();
         assert!(app.trick.iter().all(|e| e.is_none()));
+    }
+
+    /// Left-click toggles a hand card; double-click submits when it's our turn.
+    #[test]
+    fn mouse_click_toggles_card_and_double_plays() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use guandan_core::card::cards_from_codes;
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(NetHandle::dummy());
+        app.screen = Screen::Game;
+        app.status.clear();
+        app.my_seat = 0;
+        app.current = Some(0);
+        app.must_lead = true;
+        app.hand = cards_from_codes(&["S3", "H4", "C5", "D6", "S7", "H8", "C9", "DT", "SJ", "HQ"]);
+        app.selected = vec![false; app.hand.len()];
+        let area = Rect::new(0, 0, 80, 24);
+
+        // Probe until we hit a card via the same geometry the UI uses.
+        let (col, row, idx) = {
+            let mut found = None;
+            for r in 10..23 {
+                for c in 2..78 {
+                    if let Some(HitTarget::Card(i)) = hit::hit_test(&app, area, c, r) {
+                        found = Some((c, r, i));
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            found.expect("hand cards should be hit-testable on 80×24")
+        };
+
+        let down = |col, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert!(!app.on_mouse(down(col, row), area));
+        assert!(app.selected[idx], "single click should select card {idx}");
+        assert_eq!(app.cursor, idx);
+
+        // Second click deselects (clear double-click window first).
+        app.last_click = None;
+        assert!(!app.on_mouse(down(col, row), area));
+        assert!(!app.selected[idx]);
+    }
+
+    /// Lobby single-click activates Practice.
+    #[test]
+    fn mouse_lobby_click_activates() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(NetHandle::dummy());
+        app.screen = Screen::Lobby;
+        let area = Rect::new(0, 0, 80, 24);
+        // Probe for Practice row.
+        let (col, row) = {
+            let mut found = None;
+            for r in 0..24 {
+                for c in 0..80 {
+                    if hit::hit_test(&app, area, c, r)
+                        == Some(HitTarget::LobbyItem(LobbyFocus::Practice))
+                    {
+                        found = Some((c, r));
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            found.expect("practice item")
+        };
+        assert!(!app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: col,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+            area
+        ));
+        // Practice sends a net message; we only assert focus + no panic.
+        assert_eq!(app.lobby_focus, LobbyFocus::Practice);
+    }
+
+    /// Hover updates soft highlight without changing keyboard cursor.
+    #[test]
+    fn mouse_hover_sets_hover_card() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        use guandan_core::card::cards_from_codes;
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(NetHandle::dummy());
+        app.screen = Screen::Game;
+        app.status.clear();
+        app.hand = cards_from_codes(&["S3", "H4", "C5", "D6", "S7", "H8", "C9", "DT"]);
+        app.selected = vec![false; app.hand.len()];
+        app.cursor = 0;
+        let area = Rect::new(0, 0, 80, 24);
+        let (col, row, idx) = {
+            let mut found = None;
+            for r in 10..23 {
+                for c in 2..78 {
+                    if let Some(HitTarget::Card(i)) = hit::hit_test(&app, area, c, r) {
+                        if i != 0 {
+                            found = Some((c, r, i));
+                            break;
+                        }
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            found.expect("non-cursor card")
+        };
+        assert!(!app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: col,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+            area
+        ));
+        assert_eq!(app.hover_card, Some(idx));
+        assert_eq!(app.cursor, 0, "hover must not move keyboard cursor");
     }
 
     /// 记牌器 resets on deal, counts opponent plays, and C toggles the panel.

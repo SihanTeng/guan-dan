@@ -557,7 +557,7 @@ fn draw_felt(f: &mut Frame, app: &App, area: Rect) {
     if let Some(ref lp) = app.last_play {
         // Prefer real card faces when the felt is tall enough.
         if inner.height >= CARD_H && inner.width >= CARD_W {
-            let cards: Vec<_> = lp.cards.iter().map(|c| (*c, false, false)).collect();
+            let cards: Vec<_> = lp.cards.iter().map(|c| (*c, false, false, false)).collect();
             f.render_widget(
                 FeltCards {
                     cards,
@@ -580,7 +580,7 @@ fn draw_felt(f: &mut Frame, app: &App, area: Rect) {
 
 /// Centered card faces for the felt (no selection chrome).
 struct FeltCards {
-    cards: Vec<(guandan_core::Card, bool, bool)>,
+    cards: Vec<cards::CardFlags>,
     level: guandan_core::Rank,
 }
 
@@ -597,12 +597,13 @@ impl Widget for FeltCards {
             let labels: Vec<Span> = self
                 .cards
                 .iter()
-                .map(|(c, _, _)| {
+                .map(|(c, _, _, _)| {
                     let face = cards::CardFace {
                         card: *c,
                         level: self.level,
                         selected: false,
                         cursor: false,
+                        hover: false,
                     };
                     Span::styled(
                         format!("{} ", face.strip_label()),
@@ -693,6 +694,7 @@ fn draw_hand(f: &mut Frame, app: &App, area: Rect) {
                 *c,
                 app.selected.get(i).copied().unwrap_or(false),
                 i == app.cursor,
+                app.hover_card == Some(i),
             )
         })
         .collect();
@@ -707,7 +709,7 @@ fn draw_hand(f: &mut Frame, app: &App, area: Rect) {
 }
 
 struct HandGrid {
-    cards: Vec<(guandan_core::Card, bool, bool)>,
+    cards: Vec<cards::CardFlags>,
     level: guandan_core::Rank,
 }
 
@@ -718,19 +720,20 @@ impl Widget for HandGrid {
             let labels: Vec<Span> = self
                 .cards
                 .iter()
-                .map(|(c, sel, cur)| {
+                .map(|(c, sel, cur, hov)| {
                     let face = cards::CardFace {
                         card: *c,
                         level: self.level,
                         selected: *sel,
                         cursor: *cur,
+                        hover: *hov,
                     };
                     let style = if *cur {
                         Style::default()
                             .fg(face.ink())
                             .bg(theme::PAPER_SEL)
                             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                    } else if *sel {
+                    } else if *sel || *hov {
                         Style::default()
                             .fg(face.ink())
                             .bg(theme::PAPER_SEL)
@@ -805,7 +808,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         ])
     } else {
         Line::from(Span::styled(
-            "  键入 34567 / KK    Enter 出    P 过    ←→ Space 点选    C 记牌    H 帮助",
+            "  键入 34567 / KK    Enter/点桌 出    P/右键 过    单击选牌  双击出    滚轮  C记牌  H帮助",
             Style::default().fg(MUTED).bg(BG),
         ))
     };
